@@ -454,6 +454,90 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.close(lid)['reason'],'old_coordinator_operations_need_attestation')
         self.assertEqual(self.lib.operator_reconcile(d['id'],'observed all old processes ended',stopped=True,operations_ended=True)['state'],'closed')
 
+    def test_prepared_return_wedge_recovered_by_operation_end_and_reconcile(self):
+        # Gap: a dead prepared return at an old fence blocked every later return
+        # and operator reconcile could not collect it; the device was wedged.
+        d = self.physical()
+        a = self.borrow(kind='physical'); lid = a['lease']['id']
+        h1 = self.lib.return_lease(lid, self.token, 'first attempt')
+        op1 = h1['operation']
+        self.assertEqual(dict(self.lib.db.execute('SELECT state,fence FROM operations WHERE id=?', (op1,)).fetchone())['state'], 'prepared')
+        fence = self.lib.device(d['id'])['fence']
+        # The client exited without acknowledging; a connection change fenced it.
+        f = self.adapter.read(); f['devices'][d['id']]['transport'] = 'new'; self.fixture.write_text(json.dumps(f))
+        self.lib.reconcile()
+        self.assertEqual(self.lib.device(d['id'])['fence'], fence + 1)
+        self.assertEqual(self.lib.device(d['id'])['state'], 'quarantined')
+        # Borrower retry is refused by the dead prepared operation, named in diagnostics.
+        h2 = self.lib.return_lease(lid, self.token, 'retry after fencing')
+        result = self.lib.acknowledge(h2['id'], self.token, 'stopped')
+        self.assertEqual(result['reason'], 'old_coordinator_operations_need_attestation')
+        self.assertIn(op1, [o['id'] for o in result['blocking_operations']])
+        self.assertEqual(result['blocking_operations'][0]['state'], 'prepared')
+        # Reconcile alone still cannot finish while the prepared leftover blocks.
+        blocked = self.lib.operator_reconcile(d['id'], 'old client stopped', stopped=True)
+        self.assertEqual(blocked['state'], 'quarantined')
+        self.assertEqual(blocked['reason'], 'old_coordinator_operations_need_attestation')
+        self.assertIn(op1, [o['id'] for o in blocked['blocking_operations']])
+        # The per-operation remedy collects the dead prepared operation.
+        ended = self.lib.operation_end(op1, 'borrower process exited; no coordinator subprocess remains')
+        self.assertEqual(ended['state'], 'operator_verified_ended')
+        # The retried return operation is waiting at the current fence: refused
+        # without stronger evidence, attestable with it.
+        with self.assertRaisesRegex(Fault, 'current_fence_operation_requires_old_client_stopped'):
+            self.lib.operation_end(h2['operation'], 'no evidence yet')
+        self.assertEqual(self.lib.operation_end(h2['operation'], 'return verifier confirmed ended', stopped=True)['state'], 'operator_verified_ended')
+        # Full operator repair now closes the lease and releases the device.
+        result = self.lib.operator_reconcile(d['id'], 'verified old users and operations stopped', stopped=True, operations_ended=True)
+        self.assertEqual(result['state'], 'closed')
+        self.assertEqual(self.lib.device(d['id'])['state'], 'available')
+        self.assertEqual(self.lib.lease(lid)['state'], 'closed')
+        self.assertEqual(self.borrow('next', kind='physical')['state'], 'active')
+
+    def test_reconcile_old_operations_ended_sweeps_dead_fenced_prepared_and_waiting(self):
+        d = self.physical()
+        a = self.borrow(kind='physical'); lid = a['lease']['id']
+        h1 = self.lib.return_lease(lid, self.token, 'first attempt')
+        f = self.adapter.read(); f['devices'][d['id']]['transport'] = 'new'; self.fixture.write_text(json.dumps(f))
+        self.lib.reconcile()
+        dead = [h1['operation']]
+        for state in ('prepared', 'waiting'):
+            with self.lib.tx():
+                op = self.lib._operation(self.lib.device(d['id']), {'id': lid}, 'return')
+                self.lib.db.execute("UPDATE operations SET state=?,fence=fence-1 WHERE id=?", (state, op))
+            dead.append(op)
+        result = self.lib.operator_reconcile(d['id'], 'verified old operations ended', stopped=True, operations_ended=True)
+        self.assertEqual(result['state'], 'closed')
+        states = {r[0]: r[1] for r in self.lib.db.execute('SELECT id,state FROM operations')}
+        for op in dead:
+            self.assertEqual(states[op], 'operator_verified_ended')
+        self.assertEqual(self.lib.device(d['id'])['state'], 'available')
+
+    def test_operation_end_refusals_and_guards(self):
+        d = self.emulator()
+        a = self.borrow(); lid = a['lease']['id']
+        with self.lib.tx():
+            running = self.lib._operation(self.lib.device(d['id']), {'id': lid}, 'wake')
+            self.lib.db.execute("UPDATE operations SET state='running' WHERE id=?", (running,))
+        with self.assertRaisesRegex(Fault, 'operation_end_reason_required'):
+            self.lib.operation_end(running, '')
+        with self.assertRaisesRegex(Fault, 'operation_end_reason_required'):
+            self.lib.operation_end(running, None)
+        with self.assertRaisesRegex(Fault, 'operation_not_found'):
+            self.lib.operation_end('nonexistent', 'reason')
+        # Running operations are never silently attestable.
+        with self.assertRaisesRegex(Fault, 'running_operation_requires_old_client_stopped'):
+            self.lib.operation_end(running, 'client exited but no evidence')
+        ended = self.lib.operation_end(running, 'verified process tree exited', stopped=True)
+        self.assertEqual(ended['state'], 'operator_verified_ended')
+        self.assertEqual(ended['result']['previous_state'], 'running')
+        # Idempotent repeat; terminal operations are refused.
+        self.assertEqual(self.lib.operation_end(running, 'again')['state'], 'operator_verified_ended')
+        h = self.lib.return_lease(lid, self.token, 'done')
+        self.assertEqual(self.lib.acknowledge(h['id'], self.token, 'stopped')['state'], 'closed')
+        with self.assertRaisesRegex(Fault, 'operation_already_terminal'):
+            self.lib.operation_end(h['operation'], 'already closed')
+
     def test_recovery_pause_resume_budget(self):
         self.emulator();a=self.borrow();lid=a['lease']['id']
         for _ in range(3):
@@ -1114,6 +1198,35 @@ class SocketTests(unittest.TestCase):
         self.assertEqual(event['payload']['actor'], {'uid':os.getuid(),'role':'operator'})
         code, out = self.cli('devices', 'delete', d['id'], credential=credential)
         self.assertEqual((code, out['reason']), (2, 'device_not_found'))
+
+    def test_operation_end_cli_auth_reason_and_attestation(self):
+        credential = self.runtime/'operator.credential'
+        admin = credential.read_text()
+        spec = {'avd_name':'fixture','avd_path':'fixture','avd_identity':'fixture','sdk_root':'fixture'}
+        self.rpc('register', {'kind':'emulator','alias':'fixture','spec':spec}, admin)
+        borrower = self.root/'borrower.token'
+        code, out = self.cli('borrow','--kind','emulator','--borrower','b','--session','s',
+                             '--request-key','key','--wait','3',credential=borrower)
+        self.assertEqual(code, 0, out)
+        lid = out['result']['lease']['id']
+        code, out = self.cli('return', lid, credential=borrower)
+        self.assertEqual(code, 3, out)
+        op = out['result']['operation']
+        # Operator credential and a reason are both mandatory.
+        code, out = self.cli('operation', 'end', op, '--reason', 'verified ended')
+        self.assertEqual((code, out['reason']), (4, 'operator_credential_required'))
+        code, out = self.cli('operation', 'end', op, credential=credential)
+        self.assertEqual((code, out['reason']), (2, 'operation_end_reason_required'))
+        # The return operation is prepared at the current fence: refused without
+        # the old-client-stopped attestation, attestable with it.
+        code, out = self.cli('operation', 'end', op, '--reason', 'no evidence', credential=credential)
+        self.assertEqual((code, out['reason']), (5, 'current_fence_operation_requires_old_client_stopped'))
+        code, out = self.cli('operation', 'end', op, '--reason', 'borrower gone; verified nothing running',
+                             '--old-client-stopped', credential=credential)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out['result']['state'], 'operator_verified_ended')
+        shown = self.cli('operation', 'show', op)[1]
+        self.assertEqual(shown['result']['state'], 'operator_verified_ended')
 
     def test_socket_borrow_requires_explicit_verifiable_owner(self):
         args={'borrower':'b','session':'s','key':'k','body':{'kind':'emulator'}}

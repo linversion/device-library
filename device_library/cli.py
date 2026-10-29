@@ -36,10 +36,14 @@ def parser():
     b.add_argument("--queue-timeout", type=float, default=3600)
     for name in ("request","lease","handoff","operation"):
         s = sub.add_parser(name)
-        s.add_argument("verb", choices={"request":["show","cancel"],"lease":["show","renew"],"handoff":["acknowledge"],"operation":["show"]}[name])
+        s.add_argument("verb", choices={"request":["show","cancel"],"lease":["show","renew"],"handoff":["acknowledge"],"operation":["show","end"]}[name])
         s.add_argument("id")
         if name == "handoff":
             s.add_argument("--state", choices=["paused","stopped"], required=True)
+        if name == "operation":
+            s.add_argument("--reason", help="required for 'end': why the operator verified this operation ended")
+            s.add_argument("--old-client-stopped", action="store_true",
+                           help="required for 'end' on running or current-fence operations")
     s = sub.add_parser("cancel"); s.add_argument("id")
     s = sub.add_parser("return"); s.add_argument("id"); s.add_argument("--reason", default="borrower_return")
     s.add_argument("--stopped", action="store_true", help="attest all direct actions and streams stopped; acknowledge the return handoff")
@@ -118,9 +122,14 @@ def main(argv=None):
                 args = {"borrower":a.borrower,"session":a.session,"key":a.request_key,"owner_pid":a.owner_pid,
                         "body":{"kind":a.kind,"task":a.task,"device":a.device,"requires":requires,"queue_timeout":a.queue_timeout}}
             elif command in ("request","lease","handoff","operation"):
-                command = {("request","cancel"):"cancel",("lease","renew"):"renew",("handoff","acknowledge"):"acknowledge"}.get((command,a.verb),command)
+                command = {("request","cancel"):"cancel",("lease","renew"):"renew",("handoff","acknowledge"):"acknowledge",("operation","end"):"operation_end"}.get((command,a.verb),command)
                 args = {"id":a.id}
                 if command == "acknowledge": args["state"] = a.state
+                if command == "operation_end":
+                    if not a.reason:
+                        raise Fault("operation_end_reason_required")
+                    args["reason"] = a.reason
+                    args["stopped"] = a.old_client_stopped
             elif command in ("cancel","return","recover"):
                 args = {"id":a.id}
                 if command == "return": args["reason"] = a.reason

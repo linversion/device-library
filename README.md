@@ -308,12 +308,28 @@ Unknown old operations require the separate old-operations-ended attestation.
 These flags neither kill processes nor establish evidence automatically; the operator must possess that evidence.
 There is no global adb-server kill, fuzzy PID kill or destructive reset path.
 
+When a failed return is retried after fencing, dead `prepared`/`waiting` operations from the old fence can remain.
+A blocked return or reconcile reports `old_coordinator_operations_need_attestation` with a `blocking_operations` list naming each operation ID, kind, state, epoch and fence, plus the remedy commands.
+`--old-operations-ended` sweeps every `unknown` operation and every `prepared`/`waiting` operation fenced below the device's current fence; operations at the current fence and `running` operations keep blocking.
+To close one operation explicitly, attest it individually:
+
+```sh
+device-library --credential-file ~/.device-library-runtime/operator.credential \
+  operation end OPERATION_ID --reason 'Borrower process exited; verified no coordinator subprocess remains'
+```
+
+A reason is mandatory and the event records the operator UID, previous state and attestation.
+`unknown` and old-fence `prepared`/`waiting` operations are attestable directly; current-fence `prepared`/`waiting` and any `running` operation additionally require `--old-client-stopped`, and `running` is refused without it.
+Terminal operations (`completed`, `cancelled`, `failed`) are refused; repeating `end` on an already `operator_verified_ended` operation is idempotent.
+
 ## Inspection and persistence
 
 ```sh
 device-library doctor
 device-library devices list
 device-library operation show OPERATION_ID
+device-library --credential-file ~/.device-library-runtime/operator.credential \
+  operation end OPERATION_ID --reason '...'
 device-library history --device DEVICE_ID
 device-library history --lease LEASE_ID
 device-library history --task checkout-test

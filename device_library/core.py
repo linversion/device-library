@@ -628,8 +628,9 @@ class Library:
                 d["state"] != "quarantined" or d["fence"] != op["fence"] or
                 op["epoch"] != self.epoch or current["state"] not in ("running", "waiting")):
             raise ObservationError("auto reclaim ownership changed")
-        if self.db.execute("SELECT 1 FROM operations WHERE device=? AND id!=? AND state IN ('prepared','running','waiting','unknown')", (d["id"], op["id"])).fetchone():
-            raise ObservationError("old coordinator operations need attestation")
+        blocking = [r[0] for r in self.db.execute("SELECT id FROM operations WHERE device=? AND id!=? AND state IN ('prepared','running','waiting','unknown') ORDER BY created", (d["id"], op["id"]))]
+        if blocking:
+            raise ObservationError("old coordinator operations need attestation: " + ",".join(blocking))
         return l, d
 
     def _reclaim_failed(self, op, reason):
@@ -916,12 +917,14 @@ class Library:
     def _finish_return(self, l, h, op):
         d = self.device(l["device"])
         # Unknown old subprocesses need explicit operator observation; borrower stop alone is insufficient.
-        unknown = self.db.execute("SELECT 1 FROM operations WHERE device=? AND state IN ('unknown','running','prepared') AND id!=?", (d["id"], op["id"])).fetchone()
-        if unknown:
+        blocking = self.db.execute("SELECT id,kind,state,epoch,fence,created FROM operations WHERE device=? AND state IN ('unknown','running','prepared') AND id!=? ORDER BY created", (d["id"], op["id"])).fetchall()
+        if blocking:
             with self.tx():
                 self.db.execute("UPDATE operations SET state='waiting' WHERE id=?", (op["id"],))
                 self.db.execute("UPDATE handoffs SET state='acknowledged' WHERE id=?", (h["id"],))
-            return {"state": "quarantined", "reason": "old_coordinator_operations_need_attestation"}
+            return {"state": "quarantined", "reason": "old_coordinator_operations_need_attestation",
+                    "blocking_operations": [dict(b) for b in blocking],
+                    "remedy": "verify each old coordinator subprocess ended, then 'operation end OPERATION_ID --reason ...' or 'reconcile --device DEVICE --old-operations-ended'"}
         try:
             self._return_current(l, h, op)
             stopping = json.loads(op["result"] or "{}").get("stop_requested") is True
@@ -969,6 +972,48 @@ class Library:
             self.fail_operation(op["id"], l["id"], d["id"], str(exc) if isinstance(exc, (ObservationError, Fault)) else type(exc).__name__)
             return {"state": "quarantined", "reason": "return_unknown"}
 
+    def operation_end(self, operation, reason, stopped=False):
+        """Explicitly close one dead operation as operator_verified_ended; never replays it.
+
+        Attestable predicate:
+        - terminal states are refused (already resolved), except a repeated
+          'operator_verified_ended' which is idempotent;
+        - 'unknown' is always attestable (outcome unprovable);
+        - 'prepared'/'waiting' are attestable only when fenced below the
+          device's current fence or from an older epoch (dead leftovers no live
+          coordinator path can still own); at the current fence they require
+          the old-client-stopped attestation;
+        - 'running' always requires the old-client-stopped attestation.
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise Fault("operation_end_reason_required")
+        row = self.db.execute("SELECT * FROM operations WHERE id=?", (operation,)).fetchone()
+        if not row:
+            raise Fault("operation_not_found")
+        if row["state"] == "operator_verified_ended":
+            return self.unpack(row)
+        if row["state"] in ("completed", "cancelled", "failed"):
+            raise Fault("operation_already_terminal", 5,
+                        details={"operation_id": row["id"], "state": row["state"]})
+        device = self.db.execute("SELECT fence FROM devices WHERE id=?", (row["device"],)).fetchone()
+        stale = device is None or row["fence"] < device["fence"] or row["epoch"] != self.epoch
+        if row["state"] == "running" and stopped is not True:
+            raise Fault("running_operation_requires_old_client_stopped", 5,
+                        details={"operation_id": row["id"], "state": row["state"]})
+        if row["state"] in ("prepared", "waiting") and not stale and stopped is not True:
+            raise Fault("current_fence_operation_requires_old_client_stopped", 5,
+                        details={"operation_id": row["id"], "state": row["state"], "fence": row["fence"]})
+        with self.tx():
+            result = {"operator_attested_ended": True, "reason": reason,
+                      "previous_state": row["state"], "old_client_stopped": bool(stopped)}
+            self.db.execute("UPDATE operations SET state='operator_verified_ended',result=? WHERE id=?",
+                            (json.dumps(result), operation))
+            # A handoff whose operation ended can never be acknowledged again.
+            self.db.execute("UPDATE handoffs SET state='completed' WHERE operation=? AND state!='completed'", (operation,))
+            self.event("operator_operation_ended", device=row["device"], lease=row["lease"], operation=operation,
+                       payload={**result, "actor": {"uid": os.getuid(), "role": "operator"}})
+        return self.unpack(self.db.execute("SELECT * FROM operations WHERE id=?", (operation,)).fetchone())
+
     def operator_reconcile(self, device, reason, stopped=False, operations_ended=False):
         if not reason:
             raise Fault("reconciliation_reason_required")
@@ -981,9 +1026,18 @@ class Library:
             return result
         # Attestation explicitly covers old coordinator subprocesses, never inferred from PID.
         if operations_ended:
+            # Sweep predicate: an operation is attestable when it is 'unknown'
+            # (outcome unprovable, e.g. after restart) or a dead 'prepared'/
+            # 'waiting' leftover fenced below the device's current fence (no
+            # live coordinator path can still own it). 'running' operations and
+            # anything at the current fence keep blocking; the earlier
+            # device_operation_in_progress refusal and per-operation
+            # 'operation end' handle those with stronger evidence.
+            fence = self.device(device)["fence"]
             with self.tx():
-                self.db.execute("UPDATE operations SET state='operator_verified_ended' WHERE device=? AND state='unknown'", (device,))
-                self.event("operator_operations_ended", device=device, payload={"reason": reason, "source": "operator attestation"})
+                swept = self.db.execute("""UPDATE operations SET state='operator_verified_ended' WHERE device=?
+                    AND (state='unknown' OR (state IN ('prepared','waiting') AND fence<?))""", (device, fence)).rowcount
+                self.event("operator_operations_ended", device=device, payload={"reason": reason, "source": "operator attestation", "operations_ended": swept})
         l = self.db.execute("SELECT * FROM leases WHERE device=? AND state!='closed'", (device,)).fetchone()
         if l and stopped:
             # Reuse return protocol with new epoch/fence, old handoffs stay historical.
@@ -1080,5 +1134,5 @@ def _synchronized(method):
 # BEGIN IMMEDIATE also protects durability; never share the ledger with a second daemon.
 for _name in ("register", "retire", "delete", "reconcile", "borrow", "request", "device", "devices", "tick",
               "renew", "lease", "cancel", "return_lease", "recover", "acknowledge",
-              "operator_reconcile", "history", "backup", "retention", "auth_lease", "auth_request"):
+              "operation_end", "operator_reconcile", "history", "backup", "retention", "auth_lease", "auth_request"):
     setattr(Library, _name, _synchronized(getattr(Library, _name)))

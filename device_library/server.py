@@ -109,7 +109,7 @@ class Server:
         token = req.get("credential", "")
         if not isinstance(token, str):
             raise Fault("credential_must_be_string", 4)
-        if command in ("register", "retire", "delete", "reconcile", "backup", "retention", "shutdown"):
+        if command in ("register", "retire", "delete", "reconcile", "operation_end", "backup", "retention", "shutdown"):
             self.operator(token)
         if command == "doctor":
             return {"state": "running", "library_id": lib.library_id, "epoch": lib.epoch,
@@ -151,6 +151,8 @@ class Server:
             if not row:
                 raise Fault("operation_not_found")
             return lib.unpack(row)
+        if command == "operation_end":
+            return lib.operation_end(args["id"], args.get("reason"), args.get("stopped", False))
         if command in ("history", "watch", "audit"):
             return {"events": lib.history(**args), "policy": "cooperative-v1", "ordinary_actions": "unobserved"}
         if command == "backup":
