@@ -46,7 +46,7 @@ def parser():
     s.add_argument("--wait", type=float, default=0, help="seconds to wait for closure after --stopped")
     s = sub.add_parser("recover"); s.add_argument("id"); s.add_argument("--kind", choices=["wake","close-system-anr"], required=True)
     s = sub.add_parser("devices")
-    s.add_argument("verb", choices=["list","register","retire"])
+    s.add_argument("verb", choices=["list","register","retire","delete"])
     s.add_argument("id", nargs="?")
     s.add_argument("--reason")
     s.add_argument("--old-client-stopped", action="store_true")
@@ -125,6 +125,11 @@ def main(argv=None):
                 args = {"id":a.id}
                 if command == "return": args["reason"] = a.reason
                 if command == "recover": args["kind"] = a.kind
+            elif command == "devices" and a.verb == "delete":
+                if not a.id:
+                    raise Fault("deletion_requires_id")
+                command = "delete"
+                args = {"id":a.id}
             elif command == "devices" and a.verb == "retire":
                 if not a.id or not a.reason:
                     raise Fault("retirement_requires_id_reason")

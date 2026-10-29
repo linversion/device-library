@@ -1087,6 +1087,34 @@ class SocketTests(unittest.TestCase):
         self.assertFalse((self.root/'other').exists())
         self.assertEqual(self.rpc('doctor')['result']['adapter'],'FakeAdapter')
 
+    def test_delete_cli_auth_policy_audit_and_repeat(self):
+        credential = self.runtime/'operator.credential'
+        admin = credential.read_text()
+        spec = {'avd_name':'fixture','avd_path':'fixture','avd_identity':'fixture','sdk_root':'fixture'}
+        d = self.rpc('register', {'kind':'emulator','alias':'obsolete','spec':spec}, admin)['result']
+        code, out = self.cli('devices', 'delete', d['id'])
+        self.assertEqual((code, out['reason']), (4, 'operator_credential_required'))
+        code, out = self.cli('devices', 'delete', d['id'], credential=credential)
+        self.assertEqual((code, out['reason']), (5, 'deletion_requires_retired'))
+        code, out = self.cli('devices', 'delete', credential=credential)
+        self.assertEqual((code, out['reason']), (2, 'deletion_requires_id'))
+        self.rpc('retire', {'id':d['id'],'reason':'obsolete','stopped':True}, admin)
+        code, out = self.cli('devices', 'delete', d['id'], credential=credential)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out['schema_version'], 1)
+        self.assertTrue(out['ok'])
+        self.assertEqual(out['result'], {'state':'deleted','id':d['id']})
+        self.assertEqual(self.rpc('devices')['result']['devices'], [])
+        self.assertEqual(self.rpc('devices')['result']['claims'], [])
+        code, audit = self.cli('audit', 'export', '--device', d['id'])
+        self.assertEqual(code, 0, audit)
+        event = [e for e in audit['result']['events'] if e['type']=='device_deleted'][0]
+        self.assertEqual(event['payload']['registration']['spec'], spec)
+        self.assertEqual(event['payload']['registration']['alias'], 'obsolete')
+        self.assertEqual(event['payload']['actor'], {'uid':os.getuid(),'role':'operator'})
+        code, out = self.cli('devices', 'delete', d['id'], credential=credential)
+        self.assertEqual((code, out['reason']), (2, 'device_not_found'))
+
     def test_socket_borrow_requires_explicit_verifiable_owner(self):
         args={'borrower':'b','session':'s','key':'k','body':{'kind':'emulator'}}
         result=self.rpc('borrow',args,'t'*32)

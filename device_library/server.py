@@ -109,7 +109,7 @@ class Server:
         token = req.get("credential", "")
         if not isinstance(token, str):
             raise Fault("credential_must_be_string", 4)
-        if command in ("register", "retire", "reconcile", "backup", "retention", "shutdown"):
+        if command in ("register", "retire", "delete", "reconcile", "backup", "retention", "shutdown"):
             self.operator(token)
         if command == "doctor":
             return {"state": "running", "library_id": lib.library_id, "epoch": lib.epoch,
@@ -124,6 +124,8 @@ class Server:
             return lib.register(args["kind"], args["alias"], args["spec"])
         if command == "retire":
             return lib.retire(args["id"], args["reason"], args.get("stopped", False))
+        if command == "delete":
+            return lib.delete(args["id"])
         if command == "borrow":
             if type(args.get("owner_pid")) is not int or args["owner_pid"] <= 1:
                 raise Fault("borrow_requires_owner_pid")

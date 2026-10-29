@@ -127,6 +127,37 @@ After verifying old direct actions stopped, retire the obsolete registration wit
 Retirement refuses any unclosed lease or unresolved coordinator operation and preserves all historical leases/bindings.
 It never stops/deletes an AVD or frees a running instance slot; that instance remains foreign until transferred.
 Retired registrations are excluded from identity checks and scheduling, including after restore.
+
+Version 0.1.7 can permanently remove a retired registration from the ledger:
+
+```sh
+device-library --credential-file ~/.device-library-runtime/operator.credential \
+  devices delete DEVICE_ID
+```
+
+Deletion requires the existing operator credential and refuses every non-`retired` state,
+any unclosed lease, any linked claim, unresolved request targeting the device,
+unresolved operation (including unknown outcomes), or unfinished handoff.
+It also refuses positive online/running evidence from the ledger's observations,
+including a replacement registration sharing the identity/storage and observed foreign emulator instances.
+It never refreshes discovery, calls adb, inspects AVD storage, stops a device or deletes device files.
+Retired observations are retained rather than refreshed; a retained online observation therefore
+conservatively blocks deletion. This metadata command does not certify that a device is offline.
+Use the normal operator investigation process for conflicting observations; deletion has no force flag.
+
+Success returns `result: {"state":"deleted","id":"DEVICE_ID"}` in the usual JSON envelope.
+The registration disappears from `devices list` and the registration count; capacity claims
+and replacement registrations are unchanged. Policy refusals exit 5, missing operator credentials
+exit 4, and an unknown or already deleted ID returns `device_not_found` with exit 2.
+Deletion and its `device_deleted` audit event commit in one transaction.
+The event retains the full registration snapshot (including id, alias and spec) and operator UID/role,
+and is available through `history --device DEVICE_ID`, `audit export` and `watch`,
+using their existing 1000-event/`--after` pagination and 180-day retention policy.
+Closed leases, requests, operations, handoffs and bindings retain their history;
+closed lease device IDs are archived in ledger metadata before removing the live foreign-key reference,
+so `lease show` and `request show` continue reporting the original device ID.
+This archive follows the closed chain's existing retention policy and is included in backups.
+
 Duplicate AVD names across SDK/AVD roots are unsupported and block discovery.
 Android CLI starts inherit explicit ANDROID_AVD_HOME, ANDROID_HOME and ANDROID_SDK_ROOT for the registered paths.
 Inventory must match adb transports with host emulator processes.

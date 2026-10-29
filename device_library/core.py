@@ -57,6 +57,7 @@ class Library:
         self._local = threading.local()
         self._revision = 0
         self._inventory_signature = None
+        self._last_instances = []
         self._observation_unknown = False
         path = self.root / "ledger.sqlite3"
         if not path.exists() and not initialize:
@@ -260,6 +261,64 @@ class Library:
             raise Fault("device_not_found")
         return self.unpack(row)
 
+    def delete(self, device):
+        """Delete retired metadata using existing observations only; no adapter calls."""
+        with self.tx():
+            d = self.device(device)
+            if d["state"] != "retired":
+                raise Fault("deletion_requires_retired", 5)
+            if self.db.execute("SELECT 1 FROM leases WHERE device=? AND state IS NOT 'closed'", (device,)).fetchone():
+                raise Fault("deletion_refused_unclosed_lease", 5)
+            if self.db.execute("SELECT 1 FROM claims WHERE device=?", (device,)).fetchone():
+                raise Fault("deletion_refused_claim", 5)
+            if self.db.execute("""SELECT 1 FROM requests r WHERE
+                    (json_extract(r.body,'$.device')=? OR r.id IN (SELECT request FROM leases WHERE device=?))
+                    AND COALESCE(r.state,'') NOT IN ('closed','cancelled','timed_out','expired')""", (device, device)).fetchone():
+                raise Fault("deletion_refused_pending_request", 5)
+            if self.db.execute("""SELECT 1 FROM operations WHERE
+                    (device=? OR lease IN (SELECT id FROM leases WHERE device=?))
+                    AND COALESCE(state,'') NOT IN ('completed','cancelled')""", (device, device)).fetchone():
+                raise Fault("deletion_refused_unresolved_operation", 5)
+            if self.db.execute("""SELECT 1 FROM handoffs WHERE state IS NOT 'completed' AND
+                    (lease IN (SELECT id FROM leases WHERE device=?) OR
+                     operation IN (SELECT id FROM operations WHERE device=?))""", (device, device)).fetchone():
+                raise Fault("deletion_refused_pending_handoff", 5)
+
+            # Retirement excludes a registration from discovery. Include positive
+            # evidence from replacement registrations and foreign instances too.
+            related = [d]
+            for other in self.devices():
+                if other["id"] == device or other["kind"] != d["kind"]:
+                    continue
+                a, b = d["spec"], other["spec"]
+                if d["kind"] == "physical":
+                    same = (a["hardware_serial"] == b["hardware_serial"] or
+                            bool(set(a["serials"]) & set(b["serials"])))
+                else:
+                    same = any(a[k] == b[k] for k in ("avd_name", "avd_path", "avd_identity"))
+                if same:
+                    related.append(other)
+            serials = {r["observation"].get("serial") for r in related} - {None}
+            if d["kind"] == "physical":
+                serials.update(d["spec"]["serials"])
+            if (any(r["observation"].get("online") for r in related) or
+                    any(i.get("device_id") == device or i.get("serial") in serials or
+                        (d["kind"] == "emulator" and i.get("avd") == d["spec"]["avd_name"])
+                        for i in self._last_instances) or
+                    any(c["key"] in serials for c in self.db.execute("SELECT key FROM claims"))):
+                raise Fault("deletion_refused_observed_online", 5)
+
+            # Keep closed chains and their public device ID without retaining an
+            # inventory row or breaking SQLite's live-device foreign key.
+            for row in self.db.execute("SELECT id FROM leases WHERE device=?", (device,)).fetchall():
+                self.db.execute("INSERT INTO meta VALUES(?,?)", ("lease_device:"+row["id"], device))
+            self.db.execute("UPDATE leases SET device=NULL WHERE device=?", (device,))
+            self.event("device_deleted", device=device, payload={
+                "registration": d, "actor": {"uid": os.getuid(), "role": "operator"},
+                "device_action": "none; metadata only"})
+            self.db.execute("DELETE FROM devices WHERE id=?", (device,))
+        return {"state": "deleted", "id": device}
+
     def _topology(self):
         return tuple(tuple(row) for row in self.db.execute("SELECT id,kind,spec,state,fence,observation FROM devices ORDER BY id")), tuple(tuple(row) for row in self.db.execute("SELECT * FROM claims ORDER BY key")), tuple(tuple(row) for row in self.db.execute("SELECT id,state FROM operations WHERE state IN ('prepared','running') ORDER BY id"))
 
@@ -335,6 +394,7 @@ class Library:
                     self.event("inventory_reconciled", payload={"instances": len(seen), "claims": self.count_claims()})
                 self._inventory_signature = signature
                 self._observation_unknown = False
+            self._last_instances = observation["instances"]
             self.complete = True
             self.last_observation = self.wall()
             self.last_observation_error = None
@@ -733,6 +793,10 @@ class Library:
         if not row:
             raise Fault("lease_not_found")
         out = self.unpack(row)
+        if row["state"] == "closed" and row["device"] is None:
+            archived = self.db.execute("SELECT value FROM meta WHERE key=?", ("lease_device:"+lease,)).fetchone()
+            if archived:
+                out["device"] = archived[0]
         out["selector"] = self.device(row["device"])["observation"] if row["state"] == "active" and row["epoch"] == self.epoch else {}
         out["remaining_seconds"] = max(0, row["deadline"] - self.clock()) if row["epoch"] == self.epoch and row["state"] == "active" else 0
         out["deadline_utc"] = datetime.fromtimestamp(self.wall()+out["remaining_seconds"], timezone.utc).isoformat() if out["remaining_seconds"] else None
@@ -984,6 +1048,7 @@ class Library:
                 self.db.execute("DELETE FROM handoffs WHERE lease=?", (lid,))
                 self.db.execute("DELETE FROM operations WHERE lease=?", (lid,))
                 self.db.execute("DELETE FROM leases WHERE id=?", (lid,))
+                self.db.execute("DELETE FROM meta WHERE key=?", ("lease_device:"+lid,))
                 self.db.execute("DELETE FROM requests WHERE id=?", (r,))
                 self.db.execute("DELETE FROM meta WHERE key IN (?,?)", ("request_auth:"+r, "request_owner:"+r))
             unlinked = self.db.execute("DELETE FROM events WHERE at<? AND lease IS NULL AND request IS NULL AND operation IS NULL", (cutoff,)).rowcount
@@ -1011,7 +1076,7 @@ def _synchronized(method):
 
 # One in-process state owner; external actions release this mutex. SQLite's
 # BEGIN IMMEDIATE also protects durability; never share the ledger with a second daemon.
-for _name in ("register", "retire", "reconcile", "borrow", "request", "device", "devices", "tick",
+for _name in ("register", "retire", "delete", "reconcile", "borrow", "request", "device", "devices", "tick",
               "renew", "lease", "cancel", "return_lease", "recover", "acknowledge",
               "operator_reconcile", "history", "backup", "retention", "auth_lease", "auth_request"):
     setattr(Library, _name, _synchronized(getattr(Library, _name)))
