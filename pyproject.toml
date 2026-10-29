@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "android-device-library"
+version = "0.1.6"
+description = "Cooperative, single-user Android device lending coordinator"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+device-library = "device_library.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["device_library*"]
