@@ -275,10 +275,12 @@ class Library:
                     (json_extract(r.body,'$.device')=? OR r.id IN (SELECT request FROM leases WHERE device=?))
                     AND COALESCE(r.state,'') NOT IN ('closed','cancelled','timed_out','expired')""", (device, device)).fetchone():
                 raise Fault("deletion_refused_pending_request", 5)
-            if self.db.execute("""SELECT 1 FROM operations WHERE
+            unresolved = self.db.execute("""SELECT id,state FROM operations WHERE
                     (device=? OR lease IN (SELECT id FROM leases WHERE device=?))
-                    AND COALESCE(state,'') NOT IN ('completed','cancelled')""", (device, device)).fetchone():
-                raise Fault("deletion_refused_unresolved_operation", 5)
+                    AND COALESCE(state,'') NOT IN ('completed','cancelled','operator_verified_ended')""", (device, device)).fetchone()
+            if unresolved:
+                raise Fault("deletion_refused_unresolved_operation", 5,
+                            details={"operation_id": unresolved["id"], "state": unresolved["state"]})
             if self.db.execute("""SELECT 1 FROM handoffs WHERE state IS NOT 'completed' AND
                     (lease IN (SELECT id FROM leases WHERE device=?) OR
                      operation IN (SELECT id FROM operations WHERE device=?))""", (device, device)).fetchone():

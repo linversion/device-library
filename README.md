@@ -128,7 +128,7 @@ Retirement refuses any unclosed lease or unresolved coordinator operation and pr
 It never stops/deletes an AVD or frees a running instance slot; that instance remains foreign until transferred.
 Retired registrations are excluded from identity checks and scheduling, including after restore.
 
-Version 0.1.7 can permanently remove a retired registration from the ledger:
+Version 0.1.8 can permanently remove a retired registration from the ledger:
 
 ```sh
 device-library --credential-file ~/.device-library-runtime/operator.credential \
@@ -138,6 +138,11 @@ device-library --credential-file ~/.device-library-runtime/operator.credential \
 Deletion requires the existing operator credential and refuses every non-`retired` state,
 any unclosed lease, any linked claim, unresolved request targeting the device,
 unresolved operation (including unknown outcomes), or unfinished handoff.
+Operations in `completed`, `cancelled`, or `operator_verified_ended` (explicit operator
+reconciliation attesting that an old operation ended) allow deletion. All other operation
+states, including `failed`, still block deletion; refusal details identify the operation ID
+and its state. A failed operation remains subject to this conservative deletion policy
+even when its subprocess is known to have ended.
 It also refuses positive online/running evidence from the ledger's observations,
 including a replacement registration sharing the identity/storage and observed foreign emulator instances.
 It never refreshes discovery, calls adb, inspects AVD storage, stops a device or deletes device files.

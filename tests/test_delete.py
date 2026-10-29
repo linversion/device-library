@@ -38,6 +38,7 @@ class DeleteTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 5)
         self.assertEqual(self.lib.db.total_changes, before)
         self.assertEqual(len(self.lib.devices()), 1)
+        return caught.exception
 
     def closed_loan(self):
         request = self.lib.borrow('b', 's', 'key', {'kind': 'emulator'}, self.token)
@@ -156,10 +157,35 @@ class DeleteTests(unittest.TestCase):
         self.retire()
         with self.lib.tx():
             op = self.lib._operation(self.lib.device(self.device['id']), None, 'prepare')
-        for state in ('prepared', 'running', 'waiting', 'unknown', 'unexpected', None):
+        for state in ('prepared', 'running', 'waiting', 'unknown', 'failed', 'unexpected', None):
             with self.subTest(state=state):
                 self.lib.db.execute('UPDATE operations SET state=? WHERE id=?', (state, op))
-                self.refuse('deletion_refused_unresolved_operation')
+                fault = self.refuse('deletion_refused_unresolved_operation')
+                self.assertEqual(fault.details, {'operation_id': op, 'state': state})
+
+    def test_operator_verified_ended_operation_allows_deletion(self):
+        with self.lib.tx():
+            op = self.lib._operation(self.lib.device(self.device['id']), None, 'prepare')
+            self.lib.db.execute("UPDATE operations SET state='unknown' WHERE id=?", (op,))
+        self.lib.operator_reconcile(self.device['id'], 'old process verified ended',
+                                    stopped=True, operations_ended=True)
+        self.assertEqual(self.lib.db.execute('SELECT state FROM operations WHERE id=?', (op,)).fetchone()[0],
+                         'operator_verified_ended')
+        self.retire()
+        self.lib.delete(self.device['id'])
+        self.assertEqual(self.lib.devices(), [])
+        self.assertEqual(self.lib.history(device=self.device['id'])[-1]['type'], 'device_deleted')
+        self.assertEqual(self.lib.db.execute('SELECT state FROM operations WHERE id=?', (op,)).fetchone()[0],
+                         'operator_verified_ended')
+
+    def test_lease_linked_operator_verified_ended_operation_allows_deletion(self):
+        _, lid, _ = self.closed_loan()
+        # Historical operations may be linked only through the closed lease.
+        self.lib.db.execute("UPDATE operations SET device=NULL,state='operator_verified_ended' WHERE lease=?", (lid,))
+        self.retire()
+        self.lib.delete(self.device['id'])
+        self.assertEqual(self.lib.devices(), [])
+        self.assertEqual(self.lib.lease(lid)['state'], 'closed')
 
     def test_pending_handoff_refused_even_with_completed_operation(self):
         _, lid, hid = self.closed_loan()
