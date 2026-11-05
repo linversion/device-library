@@ -16,64 +16,109 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--json", action="store_true", help="all output is JSON (accepted for compatibility)")
     p.add_argument("--test-runtime", help="isolated fake-only endpoint; requires test manifest")
-    p.add_argument("--credential-file")
+    p.add_argument("--credential-file",
+                   help="path to your private credential file (one per borrower); the credential is the file, never a command-line token")
     sub = p.add_subparsers(dest="command", required=True)
-    s = sub.add_parser("serve")
-    s.add_argument("--data-dir", default=str(Path.home()/".local/share/device-library"))
+    s = sub.add_parser("serve",
+                       help="(operator) run the lending coordinator service in the foreground; --init creates the first ledger")
+    s.add_argument("--data-dir", default=str(Path.home()/".local/share/device-library"),
+                   help="ledger data directory (default: %(default)s)")
     s.add_argument("--init", action="store_true", help="explicitly create first ledger")
     s.add_argument("--fake-fixture", help="requires --test-runtime; never invokes Android tools")
-    b = sub.add_parser("borrow")
-    b.add_argument("--kind", choices=["physical","emulator","any"], required=True)
-    b.add_argument("--borrower", required=True)
-    b.add_argument("--session", required=True)
-    b.add_argument("--request-key", required=True)
-    b.add_argument("--task", default="")
+    b = sub.add_parser("borrow", formatter_class=argparse.RawDescriptionHelpFormatter,
+                       help="borrow one Android device: queues or activates a 30-minute lease granting direct sim-use/adb access via an explicit selector",
+                       epilog="""standard three-step flow:
+  device-library --credential-file ./my-loan.credential borrow \\
+      --kind emulator --borrower alice --session run-42 \\
+      --request-key checkout-device --wait 60
+  # ... operate the device directly with sim-use or adb using the granted selector ...
+  device-library --credential-file ./my-loan.credential return LEASE_ID --stopped
+
+--stopped attests that all direct actions and streams stopped and completes
+the return handoff acknowledgement in one step.""")
+    b.add_argument("--kind", choices=["physical","emulator","any"], required=True,
+                   help="kind of device to borrow (a request borrows exactly one device)")
+    b.add_argument("--borrower", required=True, help="your borrower identity label (attribution, not authentication)")
+    b.add_argument("--session", required=True,
+                   help="stable session ID; reuse it with the same key and credential file to retrieve your request")
+    b.add_argument("--request-key", required=True,
+                   help="idempotency key: retry the identical request to retrieve it; use a fresh key for a new loan")
+    b.add_argument("--task", default="", help="optional task label recorded in the ledger")
     b.add_argument("--owner-pid", type=int, default=os.getppid(),
                    help="long-lived borrower PID (default: invoking parent); exit ends loan")
-    b.add_argument("--device")
-    b.add_argument("--requires", action="append", default=[], metavar="KEY=VALUE")
+    b.add_argument("--device", help="request a specific registered device ID")
+    b.add_argument("--requires", action="append", default=[], metavar="KEY=VALUE",
+                   help="capability constraint, repeatable, e.g. --requires api=35")
     b.add_argument("--wait", type=float, default=0, help="seconds to poll; timeout leaves request queued")
-    b.add_argument("--queue-timeout", type=float, default=3600)
+    b.add_argument("--queue-timeout", type=float, default=3600,
+                   help="seconds the request may stay queued before expiring (default: %(default)s)")
     for name in ("request","lease","handoff","operation"):
-        s = sub.add_parser(name)
-        s.add_argument("verb", choices={"request":["show","cancel"],"lease":["show","renew"],"handoff":["acknowledge"],"operation":["show","end"]}[name])
-        s.add_argument("id")
+        s = sub.add_parser(name, help={
+            "request": "inspect (show) a borrow request you made",
+            "lease": "inspect your lease (show) or explicitly extend a still-active one (renew; two-hour continuous maximum)",
+            "handoff": "acknowledge a coordinator handoff after pausing or stopping all direct device actions",
+            "operation": "(operator) inspect (show) or attest an ended (end) coordinator operation"}[name])
+        s.add_argument("verb", choices={"request":["show","cancel"],"lease":["show","renew"],"handoff":["acknowledge"],"operation":["show","end"]}[name],
+                       help="action to perform on the record")
+        s.add_argument("id", help="ID of the request, lease, handoff or operation")
         if name == "handoff":
-            s.add_argument("--state", choices=["paused","stopped"], required=True)
+            s.add_argument("--state", choices=["paused","stopped"], required=True,
+                           help="paused: direct actions paused for recovery; stopped: all direct actions and streams stopped")
         if name == "operation":
             s.add_argument("--reason", help="required for 'end': why the operator verified this operation ended")
             s.add_argument("--old-client-stopped", action="store_true",
                            help="required for 'end' on running or current-fence operations")
-    s = sub.add_parser("cancel"); s.add_argument("id")
-    s = sub.add_parser("return"); s.add_argument("id"); s.add_argument("--reason", default="borrower_return")
+    s = sub.add_parser("cancel", help="(operator) cancel a queued borrow request by ID")
+    s.add_argument("id", help="request ID to cancel")
+    s = sub.add_parser("return",
+                       help="return a borrowed device; --stopped attests all direct actions stopped and completes the return handoff")
+    s.add_argument("id", help="lease ID to return")
+    s.add_argument("--reason", default="borrower_return", help="why the device is returned (default: %(default)s)")
     s.add_argument("--stopped", action="store_true", help="attest all direct actions and streams stopped; acknowledge the return handoff")
     s.add_argument("--wait", type=float, default=0, help="seconds to wait for closure after --stopped")
-    s = sub.add_parser("recover"); s.add_argument("id"); s.add_argument("--kind", choices=["wake","close-system-anr"], required=True)
-    s = sub.add_parser("devices")
-    s.add_argument("verb", choices=["list","register","retire","delete"])
-    s.add_argument("id", nargs="?")
-    s.add_argument("--reason")
-    s.add_argument("--old-client-stopped", action="store_true")
-    s.add_argument("--kind", choices=["physical","emulator"])
-    s.add_argument("--alias")
-    s.add_argument("--spec-file", help="JSON stable identity/policy; see README")
+    s = sub.add_parser("recover",
+                       help="request a narrowly scoped recovery on your leased device, then acknowledge the resulting handoff")
+    s.add_argument("id", help="lease ID to recover")
+    s.add_argument("--kind", choices=["wake","close-system-anr"], required=True,
+                   help="wake: dismiss keyguard (physical); close-system-anr: dismiss a system ANR dialog (emulator)")
+    s = sub.add_parser("devices",
+                       help="list registered devices and their state; operator-only verbs register/retire/delete manage registrations")
+    s.add_argument("verb", choices=["list","register","retire","delete"],
+                   help="list is borrower-safe; register/retire/delete are operator-only")
+    s.add_argument("id", nargs="?", help="device ID (required for retire/delete)")
+    s.add_argument("--reason", help="why; required for retire")
+    s.add_argument("--old-client-stopped", action="store_true",
+                   help="operator attests all old direct actions stopped (retire)")
+    s.add_argument("--kind", choices=["physical","emulator"], help="device kind (register)")
+    s.add_argument("--alias", help="human-readable registration alias (register)")
+    s.add_argument("--spec-file", help="JSON stable identity/policy; see docs/operator.md")
     for name in ("history","watch","audit"):
-        s = sub.add_parser(name)
+        s = sub.add_parser(name, help={
+            "history": "(operator) read the event log, optionally filtered by --device/--lease/--task",
+            "watch": "(operator) print ledger events; --follow keeps streaming new ones",
+            "audit": "(operator) export audit events as a JSON envelope (audit export)"}[name])
         if name == "audit":
-            s.add_argument("verb", choices=["export"])
-        s.add_argument("--after", type=int, default=0)
-        s.add_argument("--device"); s.add_argument("--lease"); s.add_argument("--task")
+            s.add_argument("verb", choices=["export"], help="export (only verb)")
+        s.add_argument("--after", type=int, default=0, help="paginate from this event sequence number")
+        s.add_argument("--device", help="filter by device ID")
+        s.add_argument("--lease", help="filter by lease ID")
+        s.add_argument("--task", help="filter by task label")
         if name == "watch":
-            s.add_argument("--follow", action="store_true")
-    s = sub.add_parser("reconcile")
-    s.add_argument("--device", required=True); s.add_argument("--reason", required=True)
+            s.add_argument("--follow", action="store_true", help="keep polling and print new events")
+    s = sub.add_parser("reconcile",
+                       help="(operator) release device quarantine after verifying old borrowers and coordinator operations ended")
+    s.add_argument("--device", required=True, help="device ID to reconcile")
+    s.add_argument("--reason", required=True, help="why you attest; a reason alone only records an observation")
     s.add_argument("--old-client-stopped", action="store_true", help="operator attests ALL old direct actions stopped")
     s.add_argument("--old-operations-ended", action="store_true", help="operator verified old coordinator subprocesses ended")
-    s = sub.add_parser("backup"); s.add_argument("path")
-    s = sub.add_parser("restore"); s.add_argument("path"); s.add_argument("--data-dir", required=True)
-    sub.add_parser("retention")
-    sub.add_parser("doctor")
-    sub.add_parser("shutdown")
+    s = sub.add_parser("backup", help="(operator) write a consistent SQLite backup of the ledger; refuses overwrite")
+    s.add_argument("path", help="destination file for the backup")
+    s = sub.add_parser("restore", help="(operator) offline-restore the ledger from a backup; requires the operator credential")
+    s.add_argument("path", help="backup file to restore from")
+    s.add_argument("--data-dir", required=True, help="data directory to restore into")
+    sub.add_parser("retention", help="(operator) delete expired metadata per the 180-day/7-day retention policy")
+    sub.add_parser("doctor", help="check service health, ledger freshness and support status without contacting or repairing devices")
+    sub.add_parser("shutdown", help="(operator) stop the running coordinator service")
     return p
 
 
