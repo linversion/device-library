@@ -24,6 +24,9 @@ def parser():
                    help="ledger data directory (default: %(default)s)")
     s.add_argument("--init", action="store_true", help="explicitly create first ledger")
     s.add_argument("--fake-fixture", help="requires --test-runtime; never invokes Android tools")
+    s.add_argument("--emulator-capacity", type=int, default=None, metavar="N",
+                   help="validated host capacity: maximum simultaneous emulator instances counted by claims "
+                        "(1-64; persisted in the ledger; default 3 when unset)")
     b = sub.add_parser("borrow", formatter_class=argparse.RawDescriptionHelpFormatter,
                        help="borrow one Android device: queues or activates a 30-minute lease granting direct sim-use/adb access via an explicit selector",
                        epilog="""standard three-step flow:
@@ -133,7 +136,8 @@ def main(argv=None):
     a = parser().parse_args(argv)
     try:
         if a.command == "serve":
-            server = Server(a.data_dir, initialize=a.init, test_runtime=a.test_runtime, fixture=a.fake_fixture)
+            server = Server(a.data_dir, initialize=a.init, test_runtime=a.test_runtime, fixture=a.fake_fixture,
+                            capacity=a.emulator_capacity)
             import signal
             def stop(signum, frame):
                 server.running = False

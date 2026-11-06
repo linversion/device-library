@@ -36,7 +36,7 @@ def read_credential(path):
 
 
 class Server:
-    def __init__(self, data_dir, *, initialize=False, test_runtime=None, fixture=None):
+    def __init__(self, data_dir, *, initialize=False, test_runtime=None, fixture=None, capacity=None):
         if bool(test_runtime) != bool(fixture):
             raise Fault("test_runtime_requires_fake_fixture", 6)
         self.runtime = Path(test_runtime) if test_runtime else production_runtime()
@@ -75,7 +75,12 @@ class Server:
             secure_write(self.admin_path, secrets.token_urlsafe(32))
         self.admin = read_credential(self.admin_path)
         adapter = FakeAdapter(fixture) if fixture else AndroidAdapter()
-        self.library = Library(data_dir, adapter, initialize=initialize)
+        self.library = Library(data_dir, adapter, initialize=initialize, capacity=capacity)
+        # Cross-device parallel, per-device serial device I/O; starts stay
+        # globally serialized inside the library. One worker per capacity slot
+        # plus one for observation keeps a single hung device from starving
+        # the pool, without unbounded thread growth.
+        self.executor_threads = max(2, min(self.library.capacity + 1, 8))
         if not manifest.exists():
             secure_write(manifest, json.dumps({"data_dir": data_dir, "library_id": self.library.library_id, "test": bool(fixture)}))
         self.path = self.runtime/"coordinator.sock"
@@ -112,6 +117,7 @@ class Server:
         if command in ("register", "retire", "delete", "reconcile", "operation_end", "backup", "retention", "shutdown"):
             self.operator(token)
         if command == "doctor":
+            now = time.time()
             return {"state": "running", "library_id": lib.library_id, "epoch": lib.epoch,
                     "inventory_complete": lib.complete, "last_observation_utc_epoch": lib.last_observation,
                     "observation_reason": lib.last_observation_error,
@@ -119,6 +125,11 @@ class Server:
                     "isolated_devices": dict(lib._isolated_devices),
                     "claims": lib.count_claims(), "data_dir": str(lib.root),
                     "adapter": type(lib.adapter).__name__, "policy": "cooperative-v1",
+                    "emulator_capacity": lib.capacity,
+                    "maintenance": lib.maintenance_status(),
+                    "device_observation_age_seconds": {
+                        d["id"]: (None if d["observed"] is None else max(0, now-d["observed"]))
+                        for d in lib.devices() if d["state"] != "retired"},
                     "support": "single host/user; direct actions require cooperative stop; live integration unverified"}
         if command == "devices":
             return {"devices": lib.devices(), "claims": [dict(r) for r in lib.db.execute("SELECT * FROM claims")], "inventory_complete": lib.complete}
@@ -200,18 +211,47 @@ class Server:
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    def maintenance(self):
+    def _control_loop(self):
+        """Bounded owner/expiry scheduling; never runs device I/O."""
         while self.running:
             try:
-                self.library.tick()
-            except sqlite3.Error:
+                self.library.control_tick()
+            except sqlite3.Error as exc:
+                self.library.maintenance_failed("control", exc)
                 self.running = False
+                break
+            except Exception as exc:
+                # Unexpected control failure: stop the loop, stay up for
+                # queries/remediation, and refuse new borrows via the ledger.
+                self.library.maintenance_failed("control", exc)
                 break
             time.sleep(1)
 
+    def _executor_loop(self, index):
+        """Bounded device I/O worker; jobs recheck epoch/fence/operation."""
+        while self.running:
+            try:
+                job = self.library.next_maintenance_job(timeout=1)
+                if job is not None:
+                    self.library.run_maintenance_job(job)
+            except sqlite3.Error as exc:
+                self.library.maintenance_failed("executor", exc)
+                self.running = False
+                break
+            except Exception as exc:
+                # A job escaping its contained fault handling is a bug: mark
+                # the executor failed (new borrows refused) and stop this
+                # worker rather than silently continuing a suspect loop.
+                self.library.maintenance_failed("executor", exc)
+                break
+
     def serve(self):
-        maint = threading.Thread(target=self.maintenance)
+        maint = threading.Thread(target=self._control_loop)
+        workers = [threading.Thread(target=self._executor_loop, args=(i,))
+                   for i in range(self.executor_threads)]
         maint.start()
+        for worker in workers:
+            worker.start()
         try:
             while self.running:
                 try:
@@ -228,6 +268,8 @@ class Server:
         finally:
             self.running = False
             maint.join()
+            for worker in workers:
+                worker.join()
             for thread in self.threads:
                 thread.join()
             self.close()

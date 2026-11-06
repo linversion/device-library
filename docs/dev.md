@@ -39,7 +39,8 @@ Do not reuse fixture data as a production ledger.
 
 Short BEGIN IMMEDIATE transactions and unique request/device-occupancy constraints arbitrate lending.
 The in-process state mutex is released around external commands; current operation, reservation and fence are rechecked before completion.
-The scheduler prepares one device at a time without restricting the three concurrently running loans.
+Maintenance is split: a bounded control loop (owner/expiry/queue transitions and durable intents) never invokes device tools, while executor workers run bounded device I/O — serial per device, parallel across devices, with emulator starts still globally serialized.
+A failed control or executor loop is visible in doctor and refuses new borrows until restart.
 Discovery snapshots are discarded if relevant device/claim/operation topology changed during observation.
 Timeout/unknown outcomes preserve occupancy and quarantine instead of replaying an action.
 Events carry UTC time and policy, and state transitions share their SQLite transaction.
@@ -48,7 +49,7 @@ Ordinary borrower actions remain unobserved.
 Epoch/fence validation protects coordinator APIs and cannot intercept direct sim-use/adb actions.
 
 Queue discipline is FIFO among earliest satisfiable requests; an impossible constraint does not block later compatible requests.
-The three-emulator cap includes starting, running, stopping/uncertain and foreign claims.
+The emulator cap (validated `serve --emulator-capacity`, persisted in the ledger, default 3) includes starting, running, stopping/uncertain and foreign claims.
 Unknown global emulator capacity blocks emulator loans and lifecycle verification; a corrupted registration or unreadable device identity quarantines only that device while healthy devices remain schedulable. External lifecycle tools can still violate the cooperative cap.
 
 ## Borrower-process ownership

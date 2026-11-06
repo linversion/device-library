@@ -165,6 +165,9 @@ Audit export is a JSON envelope, not raw JSONL. Unchanged inventory observations
 Doctor reports freshness/support without silently repairing devices, including the two-level observation trust:
 `emulator_capacity_trusted` (global adb/process agreement; unknown capacity blocks emulator starts) and
 `isolated_devices` (per-device observation failures quarantined one device at a time).
+Doctor also reports `maintenance` health: control/executor loop liveness with last success time, duration and
+error, in-flight and oldest pending operations, per-device observation age, and the configured `emulator_capacity`.
+A `failed` maintenance loop refuses new borrows; restart the coordinator and reconcile quarantined devices.
 
 ## Backup, restore, retention
 

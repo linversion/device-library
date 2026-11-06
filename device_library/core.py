@@ -1,4 +1,5 @@
 """Durable arbitration. All external actions happen between committed phases."""
+import collections
 import contextlib
 import hashlib
 import hmac
@@ -21,6 +22,16 @@ SCHEMA = 1
 POLICY = "cooperative-v1"
 TTL = 1800
 MAX_LEASE = 7200
+DEFAULT_EMULATOR_CAPACITY = 3
+MAX_EMULATOR_CAPACITY = 64
+
+
+def _validated_capacity(value):
+    """Host-configured emulator capacity: one small integer, never a guess."""
+    if type(value) is not int or not 1 <= value <= MAX_EMULATOR_CAPACITY:
+        raise Fault("invalid_emulator_capacity", 2, details={
+            "message": f"emulator capacity must be an integer in 1..{MAX_EMULATOR_CAPACITY}"})
+    return value
 
 
 class Fault(Exception):
@@ -48,10 +59,12 @@ def secure_write(path, value):
 
 
 class Library:
-    def __init__(self, directory, adapter, *, initialize=False, clock=time.monotonic, wall=time.time):
+    def __init__(self, directory, adapter, *, initialize=False, clock=time.monotonic, wall=time.time, capacity=None):
         self.root = Path(directory)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
+        if capacity is not None:
+            _validated_capacity(capacity)  # Fail before touching the ledger.
         self.adapter, self.clock, self.wall = adapter, clock, wall
         self._lock = threading.RLock()
         self._local = threading.local()
@@ -106,12 +119,46 @@ class Library:
                     self.db.execute("INSERT INTO meta VALUES(?,?)", (k, v))
         self.epoch = ident()
         self.library_id = self.db.execute("SELECT value FROM meta WHERE key='library_id'").fetchone()[0]
+        stored_capacity = self.db.execute("SELECT value FROM meta WHERE key='emulator_capacity'").fetchone()
+        if capacity is None:
+            if stored_capacity is None:
+                self.capacity = DEFAULT_EMULATOR_CAPACITY
+            else:
+                try:
+                    self.capacity = _validated_capacity(int(stored_capacity[0]))
+                except (ValueError, Fault):
+                    self.db.close()
+                    raise Fault("invalid_emulator_capacity", 6)
+        else:
+            self.capacity = _validated_capacity(capacity)
+            if stored_capacity is None or stored_capacity[0] != str(capacity):
+                with self.tx():
+                    self.db.execute("INSERT OR REPLACE INTO meta VALUES('emulator_capacity',?)", (str(capacity),))
+                    self.event("emulator_capacity_configured", payload={
+                        "capacity": capacity,
+                        "previous": int(stored_capacity[0]) if stored_capacity and stored_capacity[0].isdigit() else None})
         self.complete = False
         self.capacity_trusted = False
         self._isolated_devices = {}
         self._tick_running = False
+        self._tick_active = False
         self.last_observation = None
         self.last_observation_error = None
+        # Bounded device I/O runs on executor workers, never in the control
+        # loop. The queue is in-memory only: durable intents (expired leases,
+        # waiting operations, queued requests) are re-derived every control
+        # tick, and in-flight work is claimed by conditional state transitions.
+        self._job_condition = threading.Condition()
+        self._pending_jobs = collections.deque()
+        self._pending_keys = set()
+        self._inflight_jobs = {}
+        self._busy_devices = set()
+        # Leaf gates, acquired only inside external() with the state lock
+        # released: starts are serialized globally, observations one at a time.
+        self._start_gate = threading.Lock()
+        self._observe_gate = threading.Lock()
+        self._control_health = {"state": "not_started", "last_success": None, "last_duration": None, "last_error": None}
+        self._executor_health = {"state": "not_started", "last_success": None, "last_duration": None, "last_error": None}
         self.previous_clock, self.previous_wall = self.clock(), self.wall()
         # Every restart fences all outstanding occupancy. No old external action is replayed.
         with self.tx():
@@ -339,14 +386,22 @@ class Library:
         starts and lifecycle verification; a per-device failure isolates only
         that device and leaves healthy unrelated devices schedulable. Identity
         conflicts that cannot be attributed stay conservative at capacity level.
+
+        Trust flags describe the last applied observation, never an in-flight
+        one: executor jobs observe concurrently, so observing must not dip
+        trust for unrelated work. Failure outcomes below still clear it.
         """
-        self.complete = False
-        self.capacity_trusted = False
         try:
-            revision = self._topology()
-            observation = self.external(self.adapter.observe, [d for d in self.devices() if d["state"] != "retired"])
-            if revision != self._topology():
+            # A state transaction committed during observation discards the
+            # snapshot; reobserve a bounded number of times so callers never
+            # act on a pre-change view. Trust flags keep governing meanwhile.
+            for _attempt in range(3):
+                revision = self._topology()
+                observation = self.external(self._observe_gated, [d for d in self.devices() if d["state"] != "retired"])
+                if revision == self._topology():
+                    break
                 self.last_observation_error = "observation_superseded"
+            else:
                 return {"complete": False, "reason": "observation_superseded", "claims": self.count_claims()}
             capacity = observation.get("capacity_trusted", observation.get("complete") is True)
             device_errors = observation.get("device_errors", {})
@@ -441,6 +496,8 @@ class Library:
                         self.event("observation_unknown", payload={"scope": "emulator_capacity", "reason": self.last_observation_error})
                 self._observation_unknown = True
         except (ObservationError, OSError, ValueError, KeyError) as exc:
+            self.complete = False
+            self.capacity_trusted = False
             self.last_observation_error = str(exc) if isinstance(exc, ObservationError) else type(exc).__name__
             if not self._observation_unknown:
                 with self.tx():
@@ -449,7 +506,20 @@ class Library:
             return {"complete": False, "reason": "observation_unknown", "claims": self.count_claims()}
         return {"complete": self.complete, "capacity_trusted": self.capacity_trusted,
                 "isolated_devices": dict(self._isolated_devices),
-                "claims": self.count_claims(), "over_capacity": self.count_claims() > 3}
+                "claims": self.count_claims(), "over_capacity": self.count_claims() > self.capacity}
+
+    def _observe_gated(self, devices):
+        # One observation at a time, with the state lock released (external).
+        # Concurrent executor jobs therefore never interleave inventory reads;
+        # the second observer simply gets a newer snapshot.
+        with self._observe_gate:
+            return self.adapter.observe(devices)
+
+    def _start_gated(self, device):
+        # Red line: emulators never start in parallel. Waiting for the gate
+        # happens with the state lock released so other devices proceed.
+        with self._start_gate:
+            self.adapter.start(device)
 
     def _isolate_untrusted(self, d, reason):
         """Quarantine one device whose observation failed; never the whole pool."""
@@ -496,6 +566,14 @@ class Library:
             if not hmac.compare_digest(stored, digest(token)):
                 raise Fault("unauthorized", 4)
             return self.request(existing["id"])
+        failed = [role for role, health in self._health().items() if health["state"] == "failed"]
+        if failed:
+            # A dead maintenance loop cannot reclaim or prepare devices; lending
+            # more capacity would strand borrowers. Existing records stay readable
+            # above, and returns/renewals remain available.
+            raise Fault("maintenance_loop_failed", 6, details={
+                "failed_loops": failed,
+                "message": "Maintenance loop failed; new borrows are refused until the coordinator is restarted and healthy. Check doctor maintenance status."})
         owner_pid = os.getpid() if owner_pid is None else owner_pid
         try:
             birth = process.identity(owner_pid)
@@ -586,13 +664,200 @@ class Library:
                 all(str(d["spec"].get("capabilities", {}).get(k)) == str(v) for k, v in body.get("requires", {}).items()))
 
     def tick(self):
+        """Synchronous maintenance for single-threaded embeddings and tests.
+
+        Runs the bounded control pass and then drains pending device-I/O jobs
+        inline. The server runs the two halves on independent threads instead
+        (control_tick plus executor workers), so a hung device can never delay
+        owner/expiry processing for the rest of the pool. As before, a tick
+        already running on another thread makes concurrent tick() calls no-ops.
+        """
+        if self._tick_active:
+            return
+        self._tick_active = True
+        try:
+            self.control_tick()
+            while True:
+                job = self.next_maintenance_job(timeout=0)
+                if job is None:
+                    break
+                self.run_maintenance_job(job)
+        finally:
+            self._tick_active = False
+
+    def control_tick(self):
+        """Bounded maintenance control loop: durable transitions and intents.
+
+        Never invokes the adapter; every check is a local ledger or kernel
+        process query, so the pass stays fast no matter how hung a device is.
+        Device I/O intents are enqueued for executor workers.
+        """
         if self._tick_running:
             return
         self._tick_running = True
+        started = self.clock()
         try:
-            return self._tick()
+            self._control()
+        except BaseException as exc:
+            self._control_health["last_error"] = str(exc) or type(exc).__name__
+            raise
         finally:
             self._tick_running = False
+        self._control_health.update(state="ok", last_success=self.wall(),
+                                    last_duration=self.clock()-started, last_error=None)
+
+    def _enqueue_job(self, kind, target, device=None):
+        key = (kind, target)
+        with self._job_condition:
+            if key in self._pending_keys or key in self._inflight_jobs:
+                return
+            self._pending_jobs.append({"key": key, "kind": kind, "target": target,
+                                       "device": device, "started": None})
+            self._pending_keys.add(key)
+            self._job_condition.notify_all()
+
+    def next_maintenance_job(self, timeout=0):
+        """Claim the next runnable device-I/O job; at most one job per device.
+
+        Never takes the state lock, so workers may wait here without blocking
+        requests. Jobs whose device is busy stay queued until it frees up.
+        """
+        deadline = time.monotonic() + max(0, timeout)
+        with self._job_condition:
+            while True:
+                for job in self._pending_jobs:
+                    device = job["device"]
+                    if device is None or device not in self._busy_devices:
+                        self._pending_jobs.remove(job)
+                        self._pending_keys.discard(job["key"])
+                        if device is not None:
+                            self._busy_devices.add(device)
+                        job["started"] = self.wall()
+                        self._inflight_jobs[job["key"]] = job
+                        return job
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._job_condition.wait(remaining)
+
+    def run_maintenance_job(self, job):
+        """Run one claimed job under the single state writer's lock.
+
+        Expected device/ledger faults (ObservationError, Fault, ...) are
+        contained per job: handlers already fail the affected device/operation
+        closed. Anything unexpected propagates so the owning executor thread
+        can mark the loop failed and stop accepting new borrows.
+        """
+        started = self.clock()
+        error = None
+        try:
+            self._run_job(job)
+        except (ObservationError, OSError, ValueError, KeyError, Fault) as exc:
+            error = str(exc) or type(exc).__name__
+            self._executor_health["last_error"] = error
+        finally:
+            with self._job_condition:
+                self._inflight_jobs.pop(job["key"], None)
+                if job["device"] is not None:
+                    self._busy_devices.discard(job["device"])
+                self._job_condition.notify_all()
+        if error is None:
+            self._executor_health.update(state="ok", last_success=self.wall(),
+                                         last_duration=self.clock()-started, last_error=None)
+
+    def _run_job(self, job):
+        kind, target = job["kind"], job["target"]
+        if kind == "observe":
+            self.reconcile()
+        elif kind == "reclaim":
+            self._reclaim_expired(target)
+        elif kind == "finish-reclaim":
+            op = self.db.execute("SELECT * FROM operations WHERE id=?", (target,)).fetchone()
+            if not op or op["kind"] != "auto-reclaim" or op["state"] != "waiting" or op["epoch"] != self.epoch:
+                return
+            self.reconcile()
+            op = self.db.execute("SELECT * FROM operations WHERE id=?", (target,)).fetchone()
+            if op and op["state"] == "waiting":
+                self._finish_reclaim(op)
+        elif kind == "finish-return":
+            h = self.db.execute("SELECT * FROM handoffs WHERE id=?", (target,)).fetchone()
+            if not h or h["ack"] != "stopped" or h["state"] not in ("acknowledged", "awaiting_stop"):
+                return
+            op = self.db.execute("SELECT * FROM operations WHERE id=?", (h["operation"],)).fetchone()
+            l = self.db.execute("SELECT * FROM leases WHERE id=?", (h["lease"],)).fetchone()
+            if not op or not l or op["kind"] != "return" or op["epoch"] != self.epoch or h["epoch"] != self.epoch:
+                return
+            if h["fence"] != self.device(l["device"])["fence"] or l["state"] != "returning":
+                return
+            with self.tx():
+                # Exactly one executor (or the request path) may run a return;
+                # the conditional transition is the claim, revalidated above
+                # against epoch/fence/lease identity before any device I/O.
+                claimed = self.db.execute("UPDATE operations SET state='running' WHERE id=? AND state='waiting'",
+                                          (op["id"],)).rowcount
+                if claimed:
+                    self.db.execute("UPDATE handoffs SET state='acknowledged' WHERE id=? AND state='awaiting_stop'", (h["id"],))
+            if not claimed:
+                return
+            self._finish_return(l, h, op)
+        elif kind == "allocate":
+            r = self.db.execute("SELECT * FROM requests WHERE id=?", (target,)).fetchone()
+            if not r or r["state"] != "queued" or r["deadline"] <= self.clock():
+                return
+            body = json.loads(r["body"])
+            # Dispatch is per device under partial trust: unknown global capacity
+            # blocks emulator loans only, and untrusted devices are quarantined,
+            # never 'available'. Healthy physical devices remain schedulable.
+            for d in self.devices():
+                if d["state"] != "available" or not self.matches(d, body):
+                    continue
+                if d["kind"] == "emulator":
+                    if not self.capacity_trusted:
+                        continue
+                    if not d["observation"].get("online") and self.count_claims() >= self.capacity:
+                        continue
+                with self._job_condition:
+                    if d["id"] in self._busy_devices:
+                        continue
+                    self._busy_devices.add(d["id"])
+                    job["device"] = d["id"]
+                self._allocate(r, d)
+                break
+        else:
+            self._executor_health["last_error"] = "unknown maintenance job: " + str(kind)
+
+    def _health(self):
+        return {"control": self._control_health, "executor": self._executor_health}
+
+    def maintenance_failed(self, role, error):
+        """Fail-stop marker set by the supervisor of a dead maintenance thread."""
+        if role not in ("control", "executor"):
+            raise Fault("unknown_maintenance_role")
+        self._health()[role].update(state="failed", last_error=str(error) or type(error).__name__,
+                                    failed_at=self.wall())
+        try:
+            with self.tx():
+                self.event("maintenance_loop_failed", payload={"role": role, "error": (str(error) or type(error).__name__)[:500]})
+        except sqlite3.Error:
+            pass  # The ledger itself may be the failure; the in-memory state still refuses borrows.
+
+    def maintenance_status(self):
+        """Maintenance health for doctor: loop liveness, current and oldest work."""
+        now = self.wall()
+        with self._job_condition:
+            in_flight = [{"kind": j["kind"], "target": j["target"], "device": j["device"],
+                          "started_utc_epoch": j["started"],
+                          "elapsed_seconds": max(0, now-j["started"]) if j["started"] is not None else None}
+                         for j in self._inflight_jobs.values()]
+            queued = len(self._pending_jobs)
+        pending = [{"id": r["id"], "kind": r["kind"], "device": r["device"], "lease": r["lease"],
+                    "state": r["state"], "age_seconds": max(0, now-r["created"])}
+                   for r in self.db.execute("""SELECT id,kind,device,lease,state,created FROM operations
+                        WHERE state IN ('prepared','running','waiting','unknown') ORDER BY created""")]
+        return {"control": dict(self._control_health), "executor": {**self._executor_health,
+                "in_flight": in_flight, "queued": queued},
+                "oldest_pending_operation": pending[0] if pending else None,
+                "pending_operations": pending}
 
     def _check_owners(self):
         rows = self.db.execute("""SELECT r.id,l.id AS lease,l.state FROM requests r
@@ -632,7 +897,7 @@ class Library:
                 self.db.execute("UPDATE operations SET state='waiting' WHERE id=?", (h['operation'],))
                 self.event(reason, device=d['id'], lease=l['id'])
 
-    def _tick(self):
+    def _control(self):
         self._check_owners()
         now, wall = self.clock(), self.wall()
         if abs((wall-self.previous_wall)-(now-self.previous_clock)) > 5:
@@ -659,46 +924,45 @@ class Library:
                                     "message": "Lease expired; stop all direct actions and streams.",
                                     "action": "auto_reclaim" if self.device(l["device"])["kind"] == "emulator" else "manual_intervention_required"})
                 expired.append(l["id"])
+                d = self.device(l["device"])
+                if d["kind"] == "emulator":
+                    # Durable auto-reclaim intent, declared in the same
+                    # transaction as the expiry transition. The executor runs
+                    # the device I/O; the running operation also tells every
+                    # later observation that this offline transition is
+                    # coordinator-owned (never a connection change), exactly
+                    # once per lease, and restart-fenced like any operation.
+                    opid = self._operation(d, l, "auto-reclaim")
+                    self.db.execute("UPDATE operations SET state='running' WHERE id=?", (opid,))
+                    if not self.db.execute("SELECT 1 FROM claims WHERE device=?", (d["id"],)).fetchone():
+                        self.db.execute("INSERT INTO claims VALUES(?,?,'uncertain',?)", ("reclaim:"+opid, d["id"], opid))
             for r in self.db.execute("SELECT * FROM requests WHERE state='queued' AND deadline<=?", (now,)).fetchall():
                 self.db.execute("UPDATE requests SET state='timed_out' WHERE id=?", (r["id"],))
                 self.event("request_timed_out", request=r["id"])
-        # Refresh before every dispatch; uncertainty globally blocks new starts/loans.
+        # Durable transitions are done. Everything below only enqueues bounded
+        # device-I/O intents for executor workers; execution rechecks
+        # epoch/fence/operation identity when results return. Observation runs
+        # before dispatch: refresh first, since uncertainty globally blocks
+        # new starts/loans.
         for lid in expired:
-            if self.device(self.lease(lid)["device"])["kind"] == "emulator":
-                self._reclaim_expired(lid)
-        self.reconcile()
-        for op in self.db.execute("SELECT * FROM operations WHERE kind='auto-reclaim' AND state='waiting' AND epoch=?", (self.epoch,)).fetchall():
-            self._finish_reclaim(op)
-        if self.complete:
-            # Resume acknowledged returns after a known stop or another operation
-            # ends. Unknown operations still block; lifecycle calls are never replayed.
-            pending = self.db.execute("""SELECT h.* FROM handoffs h JOIN operations o ON o.id=h.operation
-                WHERE h.state IN ('acknowledged','awaiting_stop') AND h.ack='stopped' AND o.kind='return'
-                AND o.state='waiting' AND o.epoch=?""", (self.epoch,)).fetchall()
-            for h in pending:
-                op = self.db.execute("SELECT * FROM operations WHERE id=?", (h["operation"],)).fetchone()
-                l = self.db.execute("SELECT * FROM leases WHERE id=?", (h["lease"],)).fetchone()
-                if h["fence"] != self.device(l["device"])["fence"] or l["state"] != "returning":
-                    continue
-                with self.tx():
-                    self.db.execute("UPDATE handoffs SET state='acknowledged' WHERE id=?", (h["id"],))
-                    self.db.execute("UPDATE operations SET state='running' WHERE id=?", (op["id"],))
-                self._finish_return(l, h, op)
-        # Dispatch is per device under partial trust: unknown global capacity
-        # blocks emulator loans only, and untrusted devices are quarantined,
-        # never 'available'. Healthy physical devices remain schedulable.
-        for r in self.db.execute("SELECT * FROM requests WHERE state='queued' ORDER BY seq").fetchall():
-            body = json.loads(r["body"])
-            for d in self.devices():
-                if d["state"] != "available" or not self.matches(d, body):
-                    continue
-                if d["kind"] == "emulator":
-                    if not self.capacity_trusted:
-                        continue
-                    if not d["observation"].get("online") and self.count_claims() >= 3:
-                        continue
-                self._allocate(r, d)
-                break
+            l = self.db.execute("SELECT device FROM leases WHERE id=?", (lid,)).fetchone()
+            if l and self.device(l["device"])["kind"] == "emulator":
+                self._enqueue_job("reclaim", lid, device=l["device"])
+        self._enqueue_job("observe", "inventory")
+        for op in self.db.execute("SELECT id,device FROM operations WHERE kind='auto-reclaim' AND state='waiting' AND epoch=?", (self.epoch,)).fetchall():
+            self._enqueue_job("finish-reclaim", op["id"], device=op["device"])
+        # Resume acknowledged returns after a known stop or another operation
+        # ends. Unknown operations still block; lifecycle calls are never replayed.
+        pending = self.db.execute("""SELECT h.id,h.lease,h.fence,h.epoch FROM handoffs h JOIN operations o ON o.id=h.operation
+            WHERE h.state IN ('acknowledged','awaiting_stop') AND h.ack='stopped' AND o.kind='return'
+            AND o.state='waiting' AND o.epoch=?""", (self.epoch,)).fetchall()
+        for h in pending:
+            l = self.db.execute("SELECT device,state FROM leases WHERE id=?", (h["lease"],)).fetchone()
+            if not l or h["fence"] != self.device(l["device"])["fence"] or l["state"] != "returning":
+                continue
+            self._enqueue_job("finish-return", h["id"], device=l["device"])
+        for r in self.db.execute("SELECT id FROM requests WHERE state='queued' ORDER BY seq").fetchall():
+            self._enqueue_job("allocate", r["id"])
 
     def _quarantine(self, l, reason, state="revoked"):
         self.db.execute("UPDATE leases SET state=?,reason=? WHERE id=?", (state, reason, l["id"]))
@@ -739,19 +1003,20 @@ class Library:
         l = self.db.execute("SELECT * FROM leases WHERE id=?", (lid,)).fetchone()
         d = self.device(l["device"])
         # Re-read after external observation: a renewal/return is never a hint
-        # authorizing a stop. Only this epoch's durably expired lease qualifies.
+        # authorizing a stop. Only this epoch's durably expired lease with its
+        # declared (control-tick) reclaim operation qualifies.
         if l["state"] != "expired" or l["reason"] != "lease_expired" or l["epoch"] != self.epoch or d["kind"] != "emulator":
             return
-        with self.tx():
-            opid = self._operation(d, l, "auto-reclaim")
-            self.db.execute("UPDATE operations SET state='running' WHERE id=?", (opid,))
-            if not self.db.execute("SELECT 1 FROM claims WHERE device=?", (d["id"],)).fetchone():
-                self.db.execute("INSERT INTO claims VALUES(?,?,'uncertain',?)", ("reclaim:"+opid, d["id"], opid))
-        op = self.db.execute("SELECT * FROM operations WHERE id=?", (opid,)).fetchone()
+        op = self.db.execute("""SELECT * FROM operations WHERE lease=? AND kind='auto-reclaim'
+                AND state='running' AND epoch=?""", (lid, self.epoch)).fetchone()
+        if not op:
+            return  # Already executed, superseded, or fenced by a restart.
         try:
-            self.reconcile()
+            inventory = self.reconcile()
             l, d = self._reclaim_current(op)
-            if not self.complete:
+            if not inventory["complete"]:
+                # The destructive gate uses this call's applied observation,
+                # never a last-applied flag from before a superseded snapshot.
                 raise ObservationError("inventory unknown before stop: " + str(self.last_observation_error))
             if d["observation"].get("online") is True:
                 self.external(self.adapter.stop, d, d["observation"])
@@ -759,8 +1024,8 @@ class Library:
             elif d["observation"].get("online") is not False:
                 raise ObservationError("emulator offline state unproven")
             with self.tx():
-                self.db.execute("UPDATE operations SET state='waiting',result=? WHERE id=?", ('{"stop_requested":true}', opid))
-                self.event("auto_reclaim_stop_requested", device=d["id"], lease=lid, request=l["request"], operation=opid, payload=self._expiry_context(l))
+                self.db.execute("UPDATE operations SET state='waiting',result=? WHERE id=?", ('{"stop_requested":true}', op["id"]))
+                self.event("auto_reclaim_stop_requested", device=d["id"], lease=lid, request=l["request"], operation=op["id"], payload=self._expiry_context(l))
             self.reconcile()
             self._finish_reclaim(op)
         except (ObservationError, OSError, ValueError, KeyError) as exc:
@@ -813,7 +1078,7 @@ class Library:
             return
         if d["id"] in self._isolated_devices:
             return
-        if d["kind"] == "emulator" and not d["observation"].get("online") and self.count_claims() >= 3:
+        if d["kind"] == "emulator" and not d["observation"].get("online") and self.count_claims() >= self.capacity:
             return
         r = current_request
         lid = ident()
@@ -831,12 +1096,12 @@ class Library:
                 self.db.execute("INSERT INTO claims VALUES(?,?,?,?)", ("reservation:"+op, d["id"], "reserved", op))
         try:
             if needs_start:
-                self.external(self.adapter.start, d)
-            self.reconcile()
+                self.external(self._start_gated, d)
+            inventory = self.reconcile()
             d = self.device(d["id"])
             if d["id"] in self._isolated_devices:
                 raise ObservationError("preparation observation untrusted")
-            if needs_start and not self.capacity_trusted:
+            if needs_start and not inventory.get("capacity_trusted"):
                 raise ObservationError("preparation inventory unknown")
             prepared = self.external(self.adapter.prepare, d, d["observation"])
             if not prepared.get("healthy"):
@@ -1012,10 +1277,10 @@ class Library:
             return self._finish_return(l, h, op)
         d = self.device(l["device"])
         try:
-            self.reconcile()
+            inventory = self.reconcile()
             self.auth_lease(l["id"], token)
             d = self.device(d["id"])
-            if not self.complete:
+            if not inventory["complete"]:
                 raise ObservationError("inventory unknown")
             result = self.external(self.adapter.recover, d, d["observation"], op["kind"])
             self.auth_lease(l["id"], token)
@@ -1052,9 +1317,9 @@ class Library:
         try:
             self._return_current(l, h, op)
             stopping = json.loads(op["result"] or "{}").get("stop_requested") is True
-            self.reconcile()
+            inventory = self.reconcile()
             d = self._return_current(l, h, op)
-            if not self.complete:
+            if not inventory["complete"]:
                 if stopping:
                     self.db.execute("UPDATE operations SET state='waiting' WHERE id=?", (op["id"],))
                     return {"state": "returning", "reason": "stop_confirmation_pending",
@@ -1069,9 +1334,9 @@ class Library:
                         self.db.execute("UPDATE operations SET result=? WHERE id=?",
                                         ('{"stop_requested":true}', op["id"]))
                         self.event("emulator_stop_requested", device=d["id"], lease=l["id"], operation=op["id"])
-                self.reconcile()
+                inventory = self.reconcile()
                 d = self._return_current(l, h, op)
-                if not self.complete or d["observation"].get("online"):
+                if not inventory["complete"] or d["observation"].get("online"):
                     with self.tx():
                         self.db.execute("UPDATE operations SET state='waiting' WHERE id=?", (op["id"],))
                     return {"state": "returning", "reason": "stop_confirmation_pending",
@@ -1257,7 +1522,10 @@ def _synchronized(method):
 
 # One in-process state owner; external actions release this mutex. SQLite's
 # BEGIN IMMEDIATE also protects durability; never share the ledger with a second daemon.
+# next_maintenance_job is deliberately excluded: workers wait on the job
+# condition there and must not hold the state mutex while idle.
 for _name in ("register", "retire", "delete", "reconcile", "borrow", "request", "device", "devices", "tick",
+              "control_tick", "run_maintenance_job", "maintenance_status", "maintenance_failed",
               "renew", "lease", "cancel", "return_lease", "recover", "acknowledge", "find_request",
               "operation_end", "operator_reconcile", "history", "backup", "retention", "auth_lease", "auth_request"):
     setattr(Library, _name, _synchronized(getattr(Library, _name)))
