@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
-English | [中文导航](README.zh-CN.md)
+English | [中文](README.zh-CN.md)
 
 **Multiple AI agents debugging Android on the same machine will grab the same device at the same time and stomp on each other's sessions.** device-library is a local coordinator that stops the fight: agents borrow a device, get an exclusive lease, work on it directly, and return it when done.
 

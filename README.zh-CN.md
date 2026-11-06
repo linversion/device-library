@@ -1,4 +1,4 @@
-# device-library（中文导航）
+# device-library
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
@@ -49,7 +49,7 @@ device-library --credential-file ./my-loan.credential return LEASE_ID --reason d
 - **运维服务** —— [docs/operator.md](docs/operator.md)：运行 `serve`、注册/停用设备、隔离恢复、备份/还原与留存策略。
 - **开发维护** —— [docs/dev.md](docs/dev.md)：测试套件、假运行时、账本/协调器协议、适配层内部与验收状态。
 
-注：详细文档目前只有英文；本页为中文导航，与英文 [README.md](README.md) 对应。
+注：详细文档（docs/）目前仅有英文版本。
 
 ## 许可证
 
