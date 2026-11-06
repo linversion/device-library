@@ -1098,7 +1098,7 @@ class SocketTests(unittest.TestCase):
         spec={'avd_name':'fixture','avd_path':'fixture','avd_identity':'fixture','sdk_root':'fixture'}
         self.assertTrue(self.rpc('register',{'kind':'emulator','alias':'fixture','spec':spec},admin)['ok'])
         credential=self.root/'borrower.token'
-        command=('borrow','--kind','emulator','--borrower','independent','--session','s','--request-key','key','--wait','3')
+        command=('borrow','--kind','emulator','--borrower','independent','--session','s','--request-key','key','--owner-pid',str(os.getpid()),'--wait','3')
         code,out=self.cli(*command,credential=credential)
         self.assertEqual(code,0,out);lid=out['result']['lease']['id']
         self.assertEqual(out['result']['lease']['owner_process']['pid'],os.getpid())
@@ -1143,7 +1143,7 @@ class SocketTests(unittest.TestCase):
         self.rpc('register',{'kind':'emulator','alias':'fixture','spec':spec},admin)
         credential=self.root/'borrower.token'
         code,out=self.cli('borrow','--kind','emulator','--borrower','b','--session','s',
-                          '--request-key','key','--wait','3',credential=credential)
+                          '--request-key','key','--owner-pid',str(os.getpid()),'--wait','3',credential=credential)
         self.assertEqual(code,0,out)
         lid=out['result']['lease']['id']
         code,out=self.cli('return',lid,'--stopped','--wait','3',credential=credential)
@@ -1206,7 +1206,7 @@ class SocketTests(unittest.TestCase):
         self.rpc('register', {'kind':'emulator','alias':'fixture','spec':spec}, admin)
         borrower = self.root/'borrower.token'
         code, out = self.cli('borrow','--kind','emulator','--borrower','b','--session','s',
-                             '--request-key','key','--wait','3',credential=borrower)
+                             '--request-key','key','--owner-pid',str(os.getpid()),'--wait','3',credential=borrower)
         self.assertEqual(code, 0, out)
         lid = out['result']['lease']['id']
         code, out = self.cli('return', lid, credential=borrower)

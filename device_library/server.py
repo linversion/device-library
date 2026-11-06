@@ -238,20 +238,45 @@ class Server:
 
 def call(command, args=None, credential="", runtime=None):
     path = (Path(runtime) if runtime else production_runtime())/"coordinator.sock"
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(300)
+    # Serialize before opening the connection: invalid local input is unsent.
+    payload = json.dumps({"command": command, "args": args or {}, "credential": credential}).encode()+b"\n"
+    sock = None
+    sending = False
+    stage = "connect"
     try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(300)
         sock.connect(str(path))
-        sock.sendall(json.dumps({"command": command, "args": args or {}, "credential": credential}).encode()+b"\n")
+        stage = "send"
+        sending = True  # sendall failure can follow a partial or complete write.
+        sock.sendall(payload)
+        stage = "read"
         with sock.makefile("rb") as stream:
             data = stream.readline(2*1024*1024)
-        if not data:
-            raise Fault("coordinator_disconnected_result_unknown_retry_same_key", 7)
-        return json.loads(data)
+        stage = "decode"
+        if not data or not data.endswith(b"\n"):
+            raise ValueError("incomplete response")
+        response = json.loads(data)
+        if not isinstance(response, dict) or type(response.get("ok")) is not bool:
+            raise ValueError("invalid response envelope")
+        return response
     except (OSError, ValueError) as exc:
-        raise Fault("coordinator_unavailable_or_result_unknown", 6) from exc
+        if not sending:
+            raise Fault("coordinator_unavailable", 6, details={"command": command, "stage": stage,
+                        "request_sent": False, "remedy": "Reconnect and retry; no request was sent."}) from exc
+        remedies = {
+            "borrow": "Retry the identical borrower/session/request-key and credential to retrieve the original request.",
+            "recover": "Retry recover with the same lease/kind to retrieve its pending handoff; if completed, query lease status before starting a new recovery.",
+            "acknowledge": "Retry the same handoff/state and credential; continue only after resume_permitted=true.",
+            "return": "Retry return for the same lease to retrieve its handoff or closed status.",
+            "renew": "Query lease status first; renewal may have committed. Renew again only if still needed.",
+        }
+        raise Fault("coordinator_disconnected_result_unknown", 7, details={
+            "command": command, "args": args or {}, "stage": stage, "request_sent": "possibly",
+            "remedy": remedies.get(command, "Query the relevant request/lease/operation before retrying a mutation; its result may have committed.")}) from exc
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
 
 
 def restore(data_dir, backup, *, runtime=None):

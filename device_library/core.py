@@ -176,16 +176,20 @@ class Library:
                 for r in self.db.execute("SELECT * FROM devices ORDER BY alias,id")]
 
     def _attention(self, device):
-        l = self.db.execute("SELECT l.* FROM leases l JOIN requests r ON r.id=l.request WHERE l.device=? AND l.state!='closed' AND r.state='expired'", (device,)).fetchone()
+        l = self.db.execute("SELECT * FROM leases WHERE device=? AND state!='closed'", (device,)).fetchone()
         if not l:
+            return None
+        state, reason = self._lease_validity(l)
+        if state not in ("expired", "fenced", "revoked"):
             return None
         op = self.db.execute("SELECT * FROM operations WHERE lease=? AND kind='auto-reclaim' ORDER BY created DESC LIMIT 1", (l["id"],)).fetchone()
         r = self.db.execute("SELECT body FROM requests WHERE id=?", (l["request"],)).fetchone()
         return {"state": "reclaim_pending" if op and op["state"] in ("running", "waiting") else "manual_intervention_required",
                 "lease": l["id"], "request": l["request"], "borrower": l["borrower"],
                 "session": l["session"], "task": json.loads(r[0]).get("task"),
-                "reason": "lease_expired", "occupancy_retained": True,
-                "message": "Lease expired; stop direct actions. Device remains quarantined until verified safe.",
+                "reason": reason, "occupancy_retained": True,
+                "message": "Lease unusable; stop all direct actions and streams. Occupancy remains reserved until verified safe.",
+                "remedy": "Stop all direct actions/streams, return the lease with --stopped; ask the operator to verify unknown coordinator operations before reconciliation.",
                 "reclaim": self.unpack(op) if op else None}
 
     def register(self, kind, alias, spec):
@@ -470,10 +474,19 @@ class Library:
         if not row:
             raise Fault("request_not_found")
         out = self.unpack(row)
+        out["recorded_state"] = out["state"]
         lease = self.db.execute("SELECT * FROM leases WHERE request=?", (req,)).fetchone()
         out["lease"] = self.lease(lease["id"]) if lease else None
         if lease:
-            out["selector"] = out["lease"]["selector"]
+            # Requests own queue scheduling/history; after reservation the lease
+            # owns lifecycle status. Never interpret an old 'preparing' as a wait.
+            view = out["lease"]
+            out["state"] = "preparing" if view["state"] == "reserved" else view["state"]
+            if view["state"] == "closed" and row["state"] == "expired":
+                out["state"] = "expired"  # Preserve the terminal queue outcome.
+            for key in ("selector", "usable", "reason", "remedy", "attention"):
+                out[key] = view.get(key)
+        out["effective_state"] = out["state"]
         return out
 
     def auth_request(self, req, token):
@@ -481,11 +494,22 @@ class Library:
         if not row or not hmac.compare_digest(row[0], digest(token)):
             raise Fault("unauthorized", 4)
 
+    def _lease_validity(self, row):
+        """One authority check for reads and writes; no maintenance side effects."""
+        if row["state"] != "active":
+            return row["state"], row["reason"]
+        device = self.db.execute("SELECT fence FROM devices WHERE id=?", (row["device"],)).fetchone()
+        if row["epoch"] != self.epoch or not device or device["fence"] != row["fence"]:
+            return "fenced", "lease_fenced"
+        if row["deadline"] <= self.clock():
+            return "expired", "lease_expired"
+        return "active", None
+
     def auth_lease(self, lease, token, *, current=True):
         row = self.db.execute("SELECT * FROM leases WHERE id=?", (lease,)).fetchone()
         if not row or not hmac.compare_digest(row["token_hash"], digest(token)):
             raise Fault("unauthorized", 4)
-        if current and (row["state"] != "active" or row["epoch"] != self.epoch or row["deadline"] <= self.clock() or self.device(row["device"])["fence"] != row["fence"]):
+        if current and self._lease_validity(row)[0] != "active":
             raise Fault("lease_expired_or_fenced", 4, details={
                 "message": "Lease expired or fenced; stop all direct actions and streams. Check lease status and contact the operator if attention is required.",
                 "attention": self._attention(row["device"])})
@@ -796,12 +820,19 @@ class Library:
         if not row:
             raise Fault("lease_not_found")
         out = self.unpack(row)
+        out["recorded_state"] = row["state"]
+        out["state"], out["reason"] = self._lease_validity(row)
+        pending = self.db.execute("SELECT * FROM handoffs WHERE lease=? AND state!='completed'", (lease,)).fetchone()
+        if out["state"] == "active" and pending:
+            out["state"], out["reason"] = "recovering", "recovery_handoff_pending"
+        out["effective_state"] = out["state"]
+        out["usable"] = out["state"] == "active"
         if row["state"] == "closed" and row["device"] is None:
             archived = self.db.execute("SELECT value FROM meta WHERE key=?", ("lease_device:"+lease,)).fetchone()
             if archived:
                 out["device"] = archived[0]
-        out["selector"] = self.device(row["device"])["observation"] if row["state"] == "active" and row["epoch"] == self.epoch else {}
-        out["remaining_seconds"] = max(0, row["deadline"] - self.clock()) if row["epoch"] == self.epoch and row["state"] == "active" else 0
+        out["selector"] = self.device(row["device"])["observation"] if out["usable"] else {}
+        out["remaining_seconds"] = max(0, row["deadline"] - self.clock()) if self._lease_validity(row)[0] == "active" else 0
         out["deadline_utc"] = datetime.fromtimestamp(self.wall()+out["remaining_seconds"], timezone.utc).isoformat() if out["remaining_seconds"] else None
         for key in ("start", "heartbeat", "deadline", "maximum"):
             out[key+"_monotonic"] = out.pop(key)
@@ -810,6 +841,13 @@ class Library:
         out["owner_process"] = json.loads(saved[0]) if saved else None
         out["automatic_return"] = "stop_emulator; physical_requires_attestation" if saved else "unavailable_without_owner"
         out["attention"] = self._attention(row["device"]) if row["state"] != "closed" else None
+        out["remedy"] = None
+        if out["state"] in ("expired", "fenced", "revoked", "returning"):
+            out["remedy"] = "Stop all direct actions/streams; return LEASE_ID --stopped. Ask the operator to verify unknown coordinator operations if quarantined."
+        elif out["state"] == "recovering":
+            out["remedy"] = "Pause direct actions; acknowledge handoff " + pending["id"] + " --state paused; continue only after resume_permitted=true."
+        elif out["state"] == "closed":
+            out["remedy"] = "This loan ended; discard its selector and use a fresh request key for a new loan."
         return out
 
     def cancel(self, req, token):
@@ -851,8 +889,11 @@ class Library:
         l = self.auth_lease(lease, token)
         if kind not in ("wake", "close-system-anr"):
             raise Fault("unsupported_recovery")
-        if self.db.execute("SELECT 1 FROM handoffs WHERE lease=? AND state!='completed'", (lease,)).fetchone():
-            raise Fault("handoff_already_pending", 5)
+        pending = self.db.execute("SELECT h.*,o.kind FROM handoffs h JOIN operations o ON o.id=h.operation WHERE h.lease=? AND h.state!='completed'", (lease,)).fetchone()
+        if pending:
+            if pending["kind"] == kind and pending["epoch"] == self.epoch and pending["fence"] == l["fence"]:
+                return {k: pending[k] for k in pending.keys() if k != "kind"}
+            raise Fault("handoff_already_pending", 5, details={"handoff_id": pending["id"], "operation_id": pending["operation"]})
         recent = self.db.execute("SELECT count(*) FROM operations WHERE device=? AND kind IN ('wake','close-system-anr') AND created>?", (l["device"], self.wall()-300)).fetchone()[0]
         if recent >= 3:
             with self.tx():
@@ -872,7 +913,12 @@ class Library:
             raise Fault("handoff_not_found")
         l = self.auth_lease(h["lease"], token, current=False)
         if h["state"] == "completed":
-            return {**dict(h), "resume_permitted": False, "reason": "historical_acknowledgement_only"}
+            saved = self.db.execute("SELECT value FROM meta WHERE key=?", ("recovery_result:"+hid,)).fetchone()
+            later = self.db.execute("SELECT 1 FROM handoffs WHERE lease=? AND rowid>(SELECT rowid FROM handoffs WHERE id=?)", (h["lease"], hid)).fetchone()
+            if (saved and state == h["ack"] and not later and self._lease_validity(l)[0] == "active"
+                    and h["epoch"] == self.epoch and h["fence"] == l["fence"]):
+                return json.loads(saved[0])
+            return {**dict(h), "resume_permitted": False, "selector": {}, "reason": "recovery_superseded" if saved else "historical_acknowledgement_only"}
         if h["state"] == "acknowledged":
             return {"state": "in_progress", "operation_id": h["operation"]}
         if h["epoch"] != self.epoch or h["fence"] != self.device(l["device"])["fence"]:
@@ -898,11 +944,14 @@ class Library:
                 raise ObservationError("inventory unknown")
             result = self.external(self.adapter.recover, d, d["observation"], op["kind"])
             self.auth_lease(l["id"], token)
+            response = {"state": "completed", "resume_permitted": True, "operation_id": op["id"],
+                        "selector": d["observation"], "result": result}
             with self.tx():
                 self.db.execute("UPDATE operations SET state='completed',result=? WHERE id=?", (json.dumps(result), op["id"]))
                 self.db.execute("UPDATE handoffs SET state='completed' WHERE id=?", (hid,))
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", ("recovery_result:"+hid, json.dumps(response)))
                 self.event("resume_permitted", device=d["id"], lease=l["id"], operation=op["id"], payload=result)
-            return {"state": "completed", "resume_permitted": True, "operation_id": op["id"], "selector": d["observation"]}
+            return response
         except (ObservationError, OSError, ValueError, Fault) as exc:
             self.fail_operation(op["id"], l["id"], d["id"], str(exc) if isinstance(exc, (ObservationError, Fault)) else type(exc).__name__)
             return {"state": "quarantined", "resume_permitted": False}
@@ -1101,6 +1150,7 @@ class Library:
             for lid in ids:
                 r = self.db.execute("SELECT request FROM leases WHERE id=?", (lid,)).fetchone()[0]
                 self.db.execute("DELETE FROM events WHERE lease=? OR request=?", (lid,r))
+                self.db.execute("DELETE FROM meta WHERE key IN (SELECT 'recovery_result:'||id FROM handoffs WHERE lease=?)", (lid,))
                 self.db.execute("DELETE FROM handoffs WHERE lease=?", (lid,))
                 self.db.execute("DELETE FROM operations WHERE lease=?", (lid,))
                 self.db.execute("DELETE FROM leases WHERE id=?", (lid,))

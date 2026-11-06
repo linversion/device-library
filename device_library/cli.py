@@ -2,7 +2,6 @@
 import argparse
 import json
 import math
-import os
 import secrets
 import sqlite3
 import sys
@@ -30,12 +29,15 @@ def parser():
                        epilog="""standard three-step flow:
   device-library --credential-file ./my-loan.credential borrow \\
       --kind emulator --borrower alice --session run-42 \\
-      --request-key checkout-device --wait 60
+      --request-key checkout-device --owner-pid "$DEVICE_LIBRARY_OWNER_PID" --wait 60
   # ... operate the device directly with sim-use or adb using the granted selector ...
   device-library --credential-file ./my-loan.credential return LEASE_ID --stopped
 
 --stopped attests that all direct actions and streams stopped and completes
-the return handoff acknowledgement in one step.""")
+the return handoff acknowledgement in one step.
+DEVICE_LIBRARY_OWNER_PID must be supplied by your runtime: a stable task/session
+process that outlives every short shell and all device actions. No parent PID is
+guessed; do not use a temporary shell's $$ or an unverified ancestor PID.""")
     b.add_argument("--kind", choices=["physical","emulator","any"], required=True,
                    help="kind of device to borrow (a request borrows exactly one device)")
     b.add_argument("--borrower", required=True, help="your borrower identity label (attribution, not authentication)")
@@ -44,8 +46,8 @@ the return handoff acknowledgement in one step.""")
     b.add_argument("--request-key", required=True,
                    help="idempotency key: retry the identical request to retrieve it; use a fresh key for a new loan")
     b.add_argument("--task", default="", help="optional task label recorded in the ledger")
-    b.add_argument("--owner-pid", type=int, default=os.getppid(),
-                   help="long-lived borrower PID (default: invoking parent); exit ends loan")
+    b.add_argument("--owner-pid", type=int,
+                   help="required stable task/session PID provided by your runtime; exit ends loan (no default)")
     b.add_argument("--device", help="request a specific registered device ID")
     b.add_argument("--requires", action="append", default=[], metavar="KEY=VALUE",
                    help="capability constraint, repeatable, e.g. --requires api=35")
@@ -153,6 +155,9 @@ def main(argv=None):
             if command == "return" and a.wait and not a.stopped:
                 raise Fault("return_wait_requires_stopped_attestation")
             if command == "borrow":
+                if a.owner_pid is None or a.owner_pid <= 1:
+                    raise Fault("borrow_requires_owner_pid", details={
+                        "remedy": "Pass --owner-pid with the stable task/session process PID supplied by your runtime; it must outlive short shells and all device actions."})
                 if not math.isfinite(a.wait) or a.wait < 0 or a.wait > 86400:
                     raise Fault("invalid_wait")
                 if not a.credential_file:
@@ -231,11 +236,19 @@ def main(argv=None):
         print(json.dumps(result))
         if not result.get("ok"): return result.get("exit_code", 2)
         state = result.get("result", {}).get("state")
+        if a.command in ("borrow", "request", "lease"):
+            if state in ("expired", "fenced"):
+                return 4
+            if state in ("revoked", "failed") or (a.command == "borrow" and state in ("closed", "cancelled", "timed_out")):
+                return 5
         if a.command == "return" and state in ("revoked", "expired"):
             return 5
-        return 3 if state in ("queued","preparing","timed_out","awaiting_stop","acknowledged","returning","in_progress") else 5 if state == "quarantined" else 0
+        return 3 if state in ("queued","preparing","timed_out","awaiting_stop","acknowledged","returning","recovering","in_progress") else 5 if state == "quarantined" else 0
     except Fault as exc:
-        print(json.dumps({"schema_version":1,"ok":False,"reason":exc.reason,"exit_code":exc.code}))
+        response = {"schema_version":1,"ok":False,"reason":exc.reason,"exit_code":exc.code}
+        if exc.details is not None:
+            response["details"] = exc.details
+        print(json.dumps(response))
         return exc.code
     except sqlite3.Error:
         print(json.dumps({"schema_version":1,"ok":False,"reason":"ledger_unwritable_or_corrupt","exit_code":6}))
