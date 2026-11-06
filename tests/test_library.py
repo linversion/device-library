@@ -969,7 +969,10 @@ class AdapterTests(unittest.TestCase):
         def runner(args):
             if args==['adb','devices','-l']:return 'List of devices attached\nemulator-5554 device transport_id:1\n'
             return ''
-        with self.assertRaisesRegex(ObservationError,'empty'):AndroidAdapter(runner=runner).observe([])
+        result = AndroidAdapter(runner=runner).observe([])
+        self.assertFalse(result['capacity_trusted'])
+        self.assertFalse(result['complete'])
+        self.assertTrue(any('empty' in e for e in result['capacity_errors']))
 
     def test_lifecycle_start_binds_sdk_avd_roots(self):
         calls=[];a=AndroidAdapter(runner=lambda args:calls.append(args))
@@ -985,7 +988,10 @@ class AdapterTests(unittest.TestCase):
             if args==['adb','devices','-l']:return 'List of devices attached\n'
             if args==['ps','-axo','pid=,comm=']:return '123 /sdk/emulator/emulator'
             return '123 /sdk/emulator/emulator -avd Test'
-        with self.assertRaises(ObservationError):AndroidAdapter(runner=runner).observe([])
+        result = AndroidAdapter(runner=runner).observe([])
+        self.assertFalse(result['capacity_trusted'])
+        self.assertFalse(result['complete'])
+        self.assertTrue(any('disagree' in e for e in result['capacity_errors']))
 
     def test_inventory_ignores_emulator_words_in_non_emulator_arguments(self):
         def runner(args):
@@ -1003,8 +1009,9 @@ class AdapterTests(unittest.TestCase):
             if args==['adb','devices','-l']:return 'List of devices attached\n'
             if args==['ps','-axo','pid=,comm=']:return '123 /sdk/emulator/qemu/qemu-system-aarch64'
             return '123 /sdk/emulator/qemu/qemu-system-aarch64 -no-window'
-        with self.assertRaisesRegex(ObservationError,'identity uncertain'):
-            AndroidAdapter(runner=runner).observe([])
+        result = AndroidAdapter(runner=runner).observe([])
+        self.assertFalse(result['capacity_trusted'])
+        self.assertTrue(any('identity uncertain' in e for e in result['capacity_errors']))
 
 
 class ProcessTests(unittest.TestCase):

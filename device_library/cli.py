@@ -56,13 +56,18 @@ guessed; do not use a temporary shell's $$ or an unverified ancestor PID.""")
                    help="seconds the request may stay queued before expiring (default: %(default)s)")
     for name in ("request","lease","handoff","operation"):
         s = sub.add_parser(name, help={
-            "request": "inspect (show) a borrow request you made",
+            "request": "inspect (show) or cancel a borrow request you made, or find it again by borrower/session/request-key after losing its ID",
             "lease": "inspect your lease (show) or explicitly extend a still-active one (renew; two-hour continuous maximum)",
             "handoff": "acknowledge a coordinator handoff after pausing or stopping all direct device actions",
             "operation": "(operator) inspect (show) or attest an ended (end) coordinator operation"}[name])
-        s.add_argument("verb", choices={"request":["show","cancel"],"lease":["show","renew"],"handoff":["acknowledge"],"operation":["show","end"]}[name],
+        s.add_argument("verb", choices={"request":["show","cancel","find"],"lease":["show","renew"],"handoff":["acknowledge"],"operation":["show","end"]}[name],
                        help="action to perform on the record")
-        s.add_argument("id", help="ID of the request, lease, handoff or operation")
+        s.add_argument("id", nargs="?" if name == "request" else None,
+                       help="ID of the request, lease, handoff or operation (not used with request find)")
+        if name == "request":
+            s.add_argument("--borrower", help="find: your borrower identity label used at borrow time")
+            s.add_argument("--session", help="find: your session ID used at borrow time")
+            s.add_argument("--request-key", help="find: your idempotency request key used at borrow time")
         if name == "handoff":
             s.add_argument("--state", choices=["paused","stopped"], required=True,
                            help="paused: direct actions paused for recovery; stopped: all direct actions and streams stopped")
@@ -172,14 +177,23 @@ def main(argv=None):
                 args = {"borrower":a.borrower,"session":a.session,"key":a.request_key,"owner_pid":a.owner_pid,
                         "body":{"kind":a.kind,"task":a.task,"device":a.device,"requires":requires,"queue_timeout":a.queue_timeout}}
             elif command in ("request","lease","handoff","operation"):
-                command = {("request","cancel"):"cancel",("lease","renew"):"renew",("handoff","acknowledge"):"acknowledge",("operation","end"):"operation_end"}.get((command,a.verb),command)
-                args = {"id":a.id}
-                if command == "acknowledge": args["state"] = a.state
-                if command == "operation_end":
-                    if not a.reason:
-                        raise Fault("operation_end_reason_required")
-                    args["reason"] = a.reason
-                    args["stopped"] = a.old_client_stopped
+                if command == "request" and a.verb == "find":
+                    if a.id is not None or not (a.borrower and a.session and a.request_key):
+                        raise Fault("request_find_requires_borrower_session_request_key", details={
+                            "remedy": "Use: request find --borrower NAME --session ID --request-key KEY with your own credential file."})
+                    command = "find_request"
+                    args = {"borrower": a.borrower, "session": a.session, "key": a.request_key}
+                else:
+                    if command == "request" and a.id is None:
+                        raise Fault("request_id_required")
+                    command = {("request","cancel"):"cancel",("lease","renew"):"renew",("handoff","acknowledge"):"acknowledge",("operation","end"):"operation_end"}.get((command,a.verb),command)
+                    args = {"id":a.id}
+                    if command == "acknowledge": args["state"] = a.state
+                    if command == "operation_end":
+                        if not a.reason:
+                            raise Fault("operation_end_reason_required")
+                        args["reason"] = a.reason
+                        args["stopped"] = a.old_client_stopped
             elif command in ("cancel","return","recover"):
                 args = {"id":a.id}
                 if command == "return": args["reason"] = a.reason

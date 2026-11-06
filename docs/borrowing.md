@@ -29,6 +29,17 @@ device-library --credential-file ./my-loan.credential return LEASE_ID --reason d
 
 Without `--stopped`, `return` only requests the handoff, exits 3, and prints the required `handoff acknowledge HANDOFF_ID --state stopped` next action.
 
+## Retrieving a lost request or lease ID
+
+If you lost the printed request or lease ID, look your request up by the identity you borrowed with:
+
+```sh
+device-library --credential-file ./my-loan.credential request find \
+  --borrower alice --session run-42 --request-key checkout-device
+```
+
+The lookup is read-only and authenticated by your own credential file — the same boundary as `request show`, no operator credential needed. It returns the full request view, including its lease (with selector, state and remedy), exactly as `request show` would. A wrong borrower/session/request-key combination returns `request_not_found`; another borrower's credential returns `unauthorized`. Closed and expired requests stay retrievable, so you can confirm a terminal outcome before borrowing again with a fresh request key.
+
 ## borrow options you will actually use
 
 - `--kind physical|emulator|any` (required) — a request borrows exactly one device.

@@ -115,6 +115,8 @@ class Server:
             return {"state": "running", "library_id": lib.library_id, "epoch": lib.epoch,
                     "inventory_complete": lib.complete, "last_observation_utc_epoch": lib.last_observation,
                     "observation_reason": lib.last_observation_error,
+                    "emulator_capacity_trusted": lib.capacity_trusted,
+                    "isolated_devices": dict(lib._isolated_devices),
                     "claims": lib.count_claims(), "data_dir": str(lib.root),
                     "adapter": type(lib.adapter).__name__, "policy": "cooperative-v1",
                     "support": "single host/user; direct actions require cooperative stop; live integration unverified"}
@@ -133,6 +135,8 @@ class Server:
         if command in ("request", "cancel"):
             lib.auth_request(args["id"], token)
             return lib.request(args["id"]) if command == "request" else lib.cancel(args["id"], token)
+        if command == "find_request":
+            return lib.find_request(args.get("borrower"), args.get("session"), args.get("key"), token)
         if command == "lease":
             lib.auth_lease(args["id"], token, current=False)
             return lib.lease(args["id"])

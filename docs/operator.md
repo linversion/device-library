@@ -86,7 +86,7 @@ device-library --credential-file ~/.device-library-runtime/operator.credential \
 ```
 
 AVD storage identity binds canonical path, filesystem device/inode and config.ini digest.
-A recreated or changed AVD blocks observation and requires operator investigation; automatic identity migration is unsupported.
+A recreated or changed AVD fails that device's observation: the registration is quarantined in isolation (healthy devices stay schedulable) and requires operator investigation; automatic identity migration is unsupported.
 After verifying old direct actions stopped, retire the obsolete registration, then register the new identity under a fresh device ID.
 Retirement refuses any unclosed lease or unresolved coordinator operation and preserves all historical leases/bindings.
 It never stops/deletes an AVD or frees a running instance slot; that instance remains foreign until transferred.
@@ -162,7 +162,9 @@ History/audit/watch return at most 1000 ordered events; paginate with the last s
 Audit export is a JSON envelope, not raw JSONL. Unchanged inventory observations are coalesced.
 `lease show`, `request show` and `devices list` expose an `attention` record with the borrower, session, task and pending action;
 `history` and `watch --follow` deliver the durable `lease_expiry_notice`.
-Doctor reports freshness/support without silently repairing devices.
+Doctor reports freshness/support without silently repairing devices, including the two-level observation trust:
+`emulator_capacity_trusted` (global adb/process agreement; unknown capacity blocks emulator starts) and
+`isolated_devices` (per-device observation failures quarantined one device at a time).
 
 ## Backup, restore, retention
 

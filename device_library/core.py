@@ -107,6 +107,8 @@ class Library:
         self.epoch = ident()
         self.library_id = self.db.execute("SELECT value FROM meta WHERE key='library_id'").fetchone()[0]
         self.complete = False
+        self.capacity_trusted = False
+        self._isolated_devices = {}
         self._tick_running = False
         self.last_observation = None
         self.last_observation_error = None
@@ -256,6 +258,7 @@ class Library:
             self.db.execute("UPDATE claims SET device=NULL,state=CASE WHEN state='live' THEN 'foreign' ELSE state END WHERE device=?", (device,))
             self.event("device_retired", device=device, payload={"reason": reason, "old_client_stopped": True, "device_action": "none; metadata only"})
         self.complete = False
+        self.capacity_trusted = False
         self.last_observation_error = "registration_retired_reconciliation_required"
         return self.device(device)
 
@@ -329,19 +332,27 @@ class Library:
         return tuple(tuple(row) for row in self.db.execute("SELECT id,kind,spec,state,fence,observation FROM devices ORDER BY id")), tuple(tuple(row) for row in self.db.execute("SELECT * FROM claims ORDER BY key")), tuple(tuple(row) for row in self.db.execute("SELECT id,state FROM operations WHERE state IN ('prepared','running') ORDER BY id"))
 
     def reconcile(self):
-        """Observation is never assumed complete following a failed command."""
+        """Observation is never assumed complete following a failed command.
+
+        Trust is two-level: global emulator capacity (adb/process agreement)
+        and per-device identity/health. A capacity failure blocks emulator
+        starts and lifecycle verification; a per-device failure isolates only
+        that device and leaves healthy unrelated devices schedulable. Identity
+        conflicts that cannot be attributed stay conservative at capacity level.
+        """
         self.complete = False
+        self.capacity_trusted = False
         try:
             revision = self._topology()
             observation = self.external(self.adapter.observe, [d for d in self.devices() if d["state"] != "retired"])
             if revision != self._topology():
                 self.last_observation_error = "observation_superseded"
                 return {"complete": False, "reason": "observation_superseded", "claims": self.count_claims()}
-            if observation.get("complete") is not True:
-                raise ObservationError("inventory incomplete")
+            capacity = observation.get("capacity_trusted", observation.get("complete") is True)
+            device_errors = observation.get("device_errors", {})
             with self.tx():
                 seen = set()
-                for instance in observation["instances"]:
+                for instance in (observation["instances"] if capacity else []):
                     key = instance["key"]
                     if key in seen:
                         raise ObservationError("duplicate instance")
@@ -366,8 +377,10 @@ class Library:
                         self.db.execute("DELETE FROM claims WHERE device=? AND key!=?", (device, key))
                     self.db.execute("INSERT OR REPLACE INTO claims VALUES(?,?,?,NULL)", (key, device, "live" if owned else "foreign"))
                 # Live/foreign observations may disappear; uncertain reservations never do automatically.
+                # With capacity untrusted the instance list itself is unusable,
+                # so existing claims are left untouched rather than re-derived.
                 for c in self.db.execute("SELECT * FROM claims").fetchall():
-                    if c["key"] not in seen and c["state"] in ("live", "foreign"):
+                    if capacity and c["key"] not in seen and c["state"] in ("live", "foreign"):
                         reclaim = self.db.execute("SELECT 1 FROM operations WHERE device=? AND kind='auto-reclaim' AND state IN ('running','waiting','unknown')", (c["device"],)).fetchone()
                         if reclaim:
                             self.db.execute("UPDATE claims SET state='uncertain' WHERE key=?", (c["key"],))
@@ -375,6 +388,15 @@ class Library:
                             self.db.execute("DELETE FROM claims WHERE key=?", (c["key"],))
                 for d in self.devices():
                     if d["state"] == "retired":
+                        continue
+                    device_error = device_errors.get(d["id"])
+                    if device_error is not None:
+                        self._isolate_untrusted(d, device_error)
+                        continue
+                    self._isolated_devices.pop(d["id"], None)
+                    if not capacity and d["kind"] == "emulator":
+                        # Emulator identities rest on the global inventory; while
+                        # capacity is unknown the last known state stays untouched.
                         continue
                     obs = observation["devices"].get(d["id"])
                     if obs is None:
@@ -395,15 +417,29 @@ class Library:
                     if old != obs:
                         self.db.execute("INSERT INTO bindings(device,observation,epoch,at) VALUES(?,?,?,?)", (d["id"], json.dumps(obs), self.epoch, self.wall()))
                         self.event("identity_observed", device=d["id"], payload=obs)
-                signature = json.dumps(observation, sort_keys=True) + str(self.count_claims())
+                signature = json.dumps({"observation": observation, "claims": self.count_claims(),
+                                        "capacity": capacity, "isolated": self._isolated_devices}, sort_keys=True)
                 if signature != self._inventory_signature or self._observation_unknown:
-                    self.event("inventory_reconciled", payload={"instances": len(seen), "claims": self.count_claims()})
+                    self.event("inventory_reconciled", payload={"instances": len(seen), "claims": self.count_claims(),
+                                                                "capacity_trusted": capacity,
+                                                                "isolated_devices": sorted(self._isolated_devices)})
                 self._inventory_signature = signature
+            if capacity:
+                self._last_instances = observation["instances"]
+            self.capacity_trusted = capacity
+            # Per-device failures are already quarantined by isolation above, so
+            # the rest of the inventory is known and may keep scheduling.
+            self.complete = capacity
+            if capacity:
+                self.last_observation = self.wall()
+                self.last_observation_error = None
                 self._observation_unknown = False
-            self._last_instances = observation["instances"]
-            self.complete = True
-            self.last_observation = self.wall()
-            self.last_observation_error = None
+            else:
+                self.last_observation_error = "; ".join(observation.get("capacity_errors") or ["emulator capacity unknown"])
+                if not self._observation_unknown:
+                    with self.tx():
+                        self.event("observation_unknown", payload={"scope": "emulator_capacity", "reason": self.last_observation_error})
+                self._observation_unknown = True
         except (ObservationError, OSError, ValueError, KeyError) as exc:
             self.last_observation_error = str(exc) if isinstance(exc, ObservationError) else type(exc).__name__
             if not self._observation_unknown:
@@ -411,7 +447,21 @@ class Library:
                     self.event("observation_unknown", payload={"reason": self.last_observation_error})
             self._observation_unknown = True
             return {"complete": False, "reason": "observation_unknown", "claims": self.count_claims()}
-        return {"complete": True, "claims": self.count_claims(), "over_capacity": self.count_claims() > 3}
+        return {"complete": self.complete, "capacity_trusted": self.capacity_trusted,
+                "isolated_devices": dict(self._isolated_devices),
+                "claims": self.count_claims(), "over_capacity": self.count_claims() > 3}
+
+    def _isolate_untrusted(self, d, reason):
+        """Quarantine one device whose observation failed; never the whole pool."""
+        if self._isolated_devices.get(d["id"]) == reason and d["state"] == "quarantined":
+            return
+        self._isolated_devices[d["id"]] = reason
+        occupied = self.db.execute("SELECT id FROM leases WHERE device=? AND state!='closed'", (d["id"],)).fetchone()
+        if occupied:
+            self.db.execute("UPDATE leases SET state='revoked',reason='observation_untrusted' WHERE id=?", (occupied["id"],))
+        self.db.execute("UPDATE devices SET state='quarantined',fence=fence+1,observed=? WHERE id=?", (self.wall(), d["id"]))
+        self.event("device_observation_untrusted", device=d["id"], lease=occupied["id"] if occupied else None,
+                   payload={"reason": reason, "isolated": "this device only; other devices remain schedulable"})
 
     def count_claims(self):
         return self.db.execute("SELECT count(*) FROM claims").fetchone()[0]
@@ -493,6 +543,21 @@ class Library:
         row = self.db.execute("SELECT value FROM meta WHERE key=?", ("request_auth:"+req,)).fetchone()
         if not row or not hmac.compare_digest(row[0], digest(token)):
             raise Fault("unauthorized", 4)
+
+    def find_request(self, borrower, session, key, token):
+        """Borrower self-service lookup when the request/lease ID was lost.
+
+        Read-only and authenticated by the borrower's own credential, the same
+        boundary as 'request show'; no operator credential is involved.
+        """
+        if not all(isinstance(x, str) and x for x in (borrower, session, key)):
+            raise Fault("borrower_session_and_request_key_required")
+        row = self.db.execute("SELECT id FROM requests WHERE borrower=? AND session=? AND request_key=?",
+                              (borrower, session, key)).fetchone()
+        if not row:
+            raise Fault("request_not_found")
+        self.auth_request(row["id"], token)
+        return self.request(row["id"])
 
     def _lease_validity(self, row):
         """One authority check for reads and writes; no maintenance side effects."""
@@ -604,31 +669,34 @@ class Library:
         self.reconcile()
         for op in self.db.execute("SELECT * FROM operations WHERE kind='auto-reclaim' AND state='waiting' AND epoch=?", (self.epoch,)).fetchall():
             self._finish_reclaim(op)
-        if not self.complete:
-            return
-        # Resume acknowledged returns after a known stop or another operation
-        # ends. Unknown operations still block; lifecycle calls are never replayed.
-        pending = self.db.execute("""SELECT h.* FROM handoffs h JOIN operations o ON o.id=h.operation
-            WHERE h.state IN ('acknowledged','awaiting_stop') AND h.ack='stopped' AND o.kind='return'
-            AND o.state='waiting' AND o.epoch=?""", (self.epoch,)).fetchall()
-        for h in pending:
-            op = self.db.execute("SELECT * FROM operations WHERE id=?", (h["operation"],)).fetchone()
-            l = self.db.execute("SELECT * FROM leases WHERE id=?", (h["lease"],)).fetchone()
-            if h["fence"] != self.device(l["device"])["fence"] or l["state"] != "returning":
-                continue
-            with self.tx():
-                self.db.execute("UPDATE handoffs SET state='acknowledged' WHERE id=?", (h["id"],))
-                self.db.execute("UPDATE operations SET state='running' WHERE id=?", (op["id"],))
-            self._finish_return(l, h, op)
-        if not self.complete:
-            return
+        if self.complete:
+            # Resume acknowledged returns after a known stop or another operation
+            # ends. Unknown operations still block; lifecycle calls are never replayed.
+            pending = self.db.execute("""SELECT h.* FROM handoffs h JOIN operations o ON o.id=h.operation
+                WHERE h.state IN ('acknowledged','awaiting_stop') AND h.ack='stopped' AND o.kind='return'
+                AND o.state='waiting' AND o.epoch=?""", (self.epoch,)).fetchall()
+            for h in pending:
+                op = self.db.execute("SELECT * FROM operations WHERE id=?", (h["operation"],)).fetchone()
+                l = self.db.execute("SELECT * FROM leases WHERE id=?", (h["lease"],)).fetchone()
+                if h["fence"] != self.device(l["device"])["fence"] or l["state"] != "returning":
+                    continue
+                with self.tx():
+                    self.db.execute("UPDATE handoffs SET state='acknowledged' WHERE id=?", (h["id"],))
+                    self.db.execute("UPDATE operations SET state='running' WHERE id=?", (op["id"],))
+                self._finish_return(l, h, op)
+        # Dispatch is per device under partial trust: unknown global capacity
+        # blocks emulator loans only, and untrusted devices are quarantined,
+        # never 'available'. Healthy physical devices remain schedulable.
         for r in self.db.execute("SELECT * FROM requests WHERE state='queued' ORDER BY seq").fetchall():
             body = json.loads(r["body"])
             for d in self.devices():
                 if d["state"] != "available" or not self.matches(d, body):
                     continue
-                if d["kind"] == "emulator" and not d["observation"].get("online") and self.count_claims() >= 3:
-                    continue
+                if d["kind"] == "emulator":
+                    if not self.capacity_trusted:
+                        continue
+                    if not d["observation"].get("online") and self.count_claims() >= 3:
+                        continue
                 self._allocate(r, d)
                 break
 
@@ -740,7 +808,12 @@ class Library:
             return
         if self.db.execute("SELECT 1 FROM leases WHERE device=? AND state!='closed'", (d["id"],)).fetchone():
             return
-        if d["kind"] == "emulator" and not d["observation"].get("online") and (not self.complete or self.count_claims() >= 3):
+        if d["kind"] == "emulator" and not self.capacity_trusted:
+            # Global emulator capacity unknown: never loan or start an emulator.
+            return
+        if d["id"] in self._isolated_devices:
+            return
+        if d["kind"] == "emulator" and not d["observation"].get("online") and self.count_claims() >= 3:
             return
         r = current_request
         lid = ident()
@@ -761,7 +834,9 @@ class Library:
                 self.external(self.adapter.start, d)
             self.reconcile()
             d = self.device(d["id"])
-            if not self.complete:
+            if d["id"] in self._isolated_devices:
+                raise ObservationError("preparation observation untrusted")
+            if needs_start and not self.capacity_trusted:
                 raise ObservationError("preparation inventory unknown")
             prepared = self.external(self.adapter.prepare, d, d["observation"])
             if not prepared.get("healthy"):
@@ -1183,6 +1258,6 @@ def _synchronized(method):
 # One in-process state owner; external actions release this mutex. SQLite's
 # BEGIN IMMEDIATE also protects durability; never share the ledger with a second daemon.
 for _name in ("register", "retire", "delete", "reconcile", "borrow", "request", "device", "devices", "tick",
-              "renew", "lease", "cancel", "return_lease", "recover", "acknowledge",
+              "renew", "lease", "cancel", "return_lease", "recover", "acknowledge", "find_request",
               "operation_end", "operator_reconcile", "history", "backup", "retention", "auth_lease", "auth_request"):
     setattr(Library, _name, _synchronized(getattr(Library, _name)))

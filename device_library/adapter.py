@@ -47,10 +47,18 @@ class AndroidAdapter:
         return self.runner(command)
 
     def observe(self, devices):
+        """Two-level trust: global emulator capacity vs per-device identity.
+
+        Returns capacity_trusted plus per-device errors instead of raising for
+        faults that can be attributed to one scope, so a single bad registration
+        or an unknown manual emulator never hides healthy unrelated devices.
+        Raises only when the raw inventory itself cannot be parsed at all.
+        """
         raw = self.runner([self.adb, "devices", "-l"])
         if not raw.startswith("List of devices attached"):
             raise ObservationError("unrecognized adb inventory")
         transports, emulators = {}, []
+        capacity_errors = []
         for line in raw.splitlines()[1:]:
             if not line.strip():
                 continue
@@ -62,14 +70,22 @@ class AndroidAdapter:
                               if p.startswith("transport_id:")), None)
             entry = {"serial": serial, "transport": transport, "online": status == "device"}
             if serial.startswith("emulator-"):
+                # ADB's emulator inventory alone cannot prove a stopped/offline
+                # emulator process does not exist; an unreadable emulator
+                # transport degrades global capacity trust, never one device.
                 if status != "device":
-                    raise ObservationError("offline emulator identity unknown")
-                names = self.adb_target(serial, "emu", "avd", "name").splitlines()
-                if not names or not names[0].strip() or names[0].strip() == "OK":
-                    raise ObservationError("emulator AVD identity empty")
-                avd = names[0].strip()
-                entry["avd"] = avd
-                emulators.append(entry)
+                    capacity_errors.append("offline emulator identity unknown: " + serial)
+                else:
+                    try:
+                        names = self.adb_target(serial, "emu", "avd", "name").splitlines()
+                    except ObservationError as exc:
+                        capacity_errors.append(str(exc))
+                    else:
+                        if not names or not names[0].strip() or names[0].strip() == "OK":
+                            capacity_errors.append("emulator AVD identity empty: " + serial)
+                        else:
+                            entry["avd"] = names[0].strip()
+                            emulators.append(entry)
             transports[serial] = entry
         # Observe emulator processes, including instances invisible to adb.
         # Match the executable, not arbitrary arguments (agent prompts can
@@ -82,57 +98,76 @@ class AndroidAdapter:
                 continue
             fields = line.strip().split(maxsplit=1)
             if len(fields) != 2 or not fields[0].isdigit():
-                raise ObservationError("host process inventory malformed")
+                capacity_errors.append("host process inventory malformed")
+                break
             pid, executable = fields
             if re.fullmatch(r"qemu-system-[\w-]+|emulator", Path(executable).name):
                 details = self.runner(["ps", "eww", "-p", pid, "-o", "command="])
                 match = re.search(r"(?:-avd\s+|@)([\w. -]+?)(?=\s+(?:-|[A-Za-z_]\w*=)|$)", details)
                 if not match:
-                    raise ObservationError("emulator process identity uncertain")
+                    capacity_errors.append("emulator process identity uncertain: pid " + pid)
+                    continue
                 name = match.group(1).strip()
                 process_avds.append(name)
                 process_details[name] = details
         visible = [e["avd"] for e in emulators]
         if sorted(process_avds) != sorted(visible):
-            raise ObservationError("process and transport inventories disagree")
+            capacity_errors.append("process and transport inventories disagree")
+        capacity_trusted = not capacity_errors
         result = {}
+        device_errors = {}
         for d in devices:
             spec = d["spec"]
-            if d["kind"] == "physical":
-                aliases = spec.get("serials", [])
-                candidates = [transports[s] for s in aliases if s in transports]
-                online = [e for e in candidates if e["online"]]
-                entry = dict(online[0]) if online else {"online": False}
-                if online:
-                    hardware = self.adb_target(entry["serial"], "shell", "getprop", "ro.serialno").strip()
-                    model = self.adb_target(entry["serial"], "shell", "getprop", "ro.product.model").strip()
-                    if hardware != spec["hardware_serial"] or model != spec["model"]:
-                        raise ObservationError("physical identity mismatch")
-                    entry["identity"] = hardware
+            try:
+                if d["kind"] == "physical":
+                    aliases = spec.get("serials", [])
+                    candidates = [transports[s] for s in aliases if s in transports]
+                    online = [e for e in candidates if e["online"]]
+                    entry = dict(online[0]) if online else {"online": False}
+                    if online:
+                        hardware = self.adb_target(entry["serial"], "shell", "getprop", "ro.serialno").strip()
+                        model = self.adb_target(entry["serial"], "shell", "getprop", "ro.product.model").strip()
+                        if hardware != spec["hardware_serial"] or model != spec["model"]:
+                            raise ObservationError("physical identity mismatch")
+                        entry["identity"] = hardware
+                else:
+                    # Resolve the launch descriptor to storage on every observation.
+                    # Launch and directory basenames need not match; the path and
+                    # directory inode + config hash must still match registration.
+                    self.validate_registration("emulator", spec)
+                    hits = [e for e in emulators if e["avd"] == spec["avd_name"]]
+                    if hits:
+                        details = process_details.get(spec["avd_name"], "")
+                        root = str(Path(spec["avd_path"]).resolve().parent)
+                        sdk = str(Path(spec["sdk_root"]).resolve())
+                        # Name is insufficient: verify actual process SDK executable and
+                        # inherited AVD root. Unsupported ps formats fail closed.
+                        if not re.search(r"(?:^|\s)"+re.escape(sdk)+r"/emulator/(?:emulator|qemu/[^ ]+)", details) or not re.search(r"(?:^|\s)ANDROID_AVD_HOME="+re.escape(root)+r"(?:\s|$)", details):
+                            raise ObservationError("running AVD root cannot be proven")
+                    if len(hits) > 1:
+                        raise ObservationError("duplicate writable AVD instances")
+                    entry = dict(hits[0]) if hits else {"online": False}
+                    entry["identity"] = spec["avd_identity"]
+            except (ObservationError, OSError, ValueError) as exc:
+                # Storage/identity faults attributable to one registration
+                # isolate that device; they never mask global capacity.
+                device_errors[d["id"]] = str(exc) or type(exc).__name__
+                result[d["id"]] = {"trusted": False, "reason": device_errors[d["id"]]}
             else:
-                # Resolve the launch descriptor to storage on every observation.
-                # Launch and directory basenames need not match; the path and
-                # directory inode + config hash must still match registration.
-                self.validate_registration("emulator", spec)
-                hits = [e for e in emulators if e["avd"] == spec["avd_name"]]
-                if hits:
-                    details = process_details.get(spec["avd_name"], "")
-                    root = str(Path(spec["avd_path"]).resolve().parent)
-                    sdk = str(Path(spec["sdk_root"]).resolve())
-                    # Name is insufficient: verify actual process SDK executable and
-                    # inherited AVD root. Unsupported ps formats fail closed.
-                    if not re.search(r"(?:^|\s)"+re.escape(sdk)+r"/emulator/(?:emulator|qemu/[^ ]+)", details) or not re.search(r"(?:^|\s)ANDROID_AVD_HOME="+re.escape(root)+r"(?:\s|$)", details):
-                        raise ObservationError("running AVD root cannot be proven")
-                if len(hits) > 1:
-                    raise ObservationError("duplicate writable AVD instances")
-                entry = dict(hits[0]) if hits else {"online": False}
-                entry["identity"] = spec["avd_identity"]
-            result[d["id"]] = entry
-        # Name alone cannot disambiguate same-name AVDs across SDK roots.
+                result[d["id"]] = entry
+        # Name alone cannot disambiguate same-name AVDs across SDK roots; this
+        # registration conflict cannot be attributed, so capacity stays unknown.
         names = [d["spec"]["avd_name"] for d in devices if d["kind"] == "emulator"]
         if len(names) != len(set(names)):
-            raise ObservationError("ambiguous AVD name across roots")
-        return {"complete": True, "devices": result,
+            capacity_trusted = False
+            capacity_errors.append("ambiguous AVD name across roots")
+            for d in devices:
+                if d["kind"] == "emulator" and names.count(d["spec"]["avd_name"]) > 1:
+                    device_errors.setdefault(d["id"], "ambiguous AVD name across roots")
+                    result[d["id"]] = {"trusted": False, "reason": "ambiguous AVD name across roots"}
+        return {"complete": capacity_trusted and not device_errors,
+                "capacity_trusted": capacity_trusted, "capacity_errors": capacity_errors,
+                "devices": result, "device_errors": device_errors,
                 "instances": [{"key": e["serial"], **e} for e in emulators]}
 
     def validate_registration(self, kind, spec):
@@ -310,7 +345,18 @@ class FakeAdapter:
         f = self.read()
         if not f.get("complete", True):
             raise ObservationError("fixture incomplete")
-        return {"complete": True, "devices": {d["id"]: f.get("devices", {}).get(d["id"], {"online": False}) for d in devices}, "instances": f.get("instances", [])}
+        errors = dict(f.get("device_errors", {}))
+        capacity = f.get("capacity_trusted", True)
+        result = {}
+        for d in devices:
+            if d["id"] in errors:
+                result[d["id"]] = {"trusted": False, "reason": errors[d["id"]]}
+            else:
+                result[d["id"]] = f.get("devices", {}).get(d["id"], {"online": False})
+        return {"complete": capacity and not errors, "capacity_trusted": capacity,
+                "capacity_errors": [] if capacity else ["fixture capacity untrusted"],
+                "devices": result, "device_errors": errors,
+                "instances": f.get("instances", [])}
 
     def change(self, device, running):
         f = self.read()

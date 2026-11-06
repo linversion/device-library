@@ -49,7 +49,7 @@ Epoch/fence validation protects coordinator APIs and cannot intercept direct sim
 
 Queue discipline is FIFO among earliest satisfiable requests; an impossible constraint does not block later compatible requests.
 The three-emulator cap includes starting, running, stopping/uncertain and foreign claims.
-Unknown inventory blocks new loans; external lifecycle tools can still violate this cooperative cap.
+Unknown global emulator capacity blocks emulator loans and lifecycle verification; a corrupted registration or unreadable device identity quarantines only that device while healthy devices remain schedulable. External lifecycle tools can still violate the cooperative cap.
 
 ## Borrower-process ownership
 

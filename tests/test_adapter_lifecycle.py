@@ -350,13 +350,15 @@ class AdapterLifecycleTests(unittest.TestCase):
                 else:
                     descriptor.write_text(f'path={target}\n')
                 try:
-                    with self.assertRaises(ObservationError):
-                        adapter.observe([self.device])
+                    result = adapter.observe([self.device])
+                    self.assertFalse(result['complete'])
+                    self.assertTrue(result['capacity_trusted'])
+                    self.assertIn(self.device['id'], result['device_errors'])
                 finally:
                     descriptor.write_text(original)
         (self.avd / 'config.ini').write_text('AvdId=changed\n')
-        with self.assertRaisesRegex(ObservationError, 'storage identity changed'):
-            adapter.observe([self.device])
+        result = adapter.observe([self.device])
+        self.assertRegex(result['device_errors'][self.device['id']], 'storage identity changed')
 
     def test_observation_fails_when_storage_or_fingerprint_unreadable(self):
         config = self.avd / 'config.ini'
@@ -365,8 +367,10 @@ class AdapterLifecycleTests(unittest.TestCase):
             with self.subTest(remove_directory=remove_directory):
                 if remove_directory:
                     self.avd.rmdir()
-                with self.assertRaises((ObservationError, OSError)):
-                    self.lib.adapter.observe([self.device])
+                result = self.lib.adapter.observe([self.device])
+                self.assertFalse(result['complete'])
+                self.assertTrue(result['capacity_trusted'])
+                self.assertIn(self.device['id'], result['device_errors'])
 
     def test_malformed_layout_keeps_device_and_slot_quarantined(self):
         self.layout = 'layout service not ready\n'
